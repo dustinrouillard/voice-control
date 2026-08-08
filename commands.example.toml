@@ -1,0 +1,208 @@
+# Copy to ~/.config/voice-control/commands.toml and edit.
+#
+# Adding a command is a config edit plus a restart - no rebuild:
+#   launchctl kickstart -k gui/$(id -u)/com.dstn.voice-control
+
+[wake]
+model = "~/.config/voice-control/computa.rpw"
+# Raise these if it triggers while you are just talking, lower them if
+# it misses you. Tune with `voice-control listen`.
+threshold = 0.5
+avg_threshold = 0.2
+
+[stt]
+model = "~/.config/voice-control/ggml-base.en-q5_1.bin"
+
+# obs-websocket. Tools -> WebSocket Server Settings in OBS.
+# wss:// works too, for an OBS on another machine.
+[obs]
+url = "ws://127.0.0.1:4455"
+# Leave empty to read OBS_PASSWORD from the environment instead, which
+# keeps the secret out of this file. If you do put it here, chmod 600.
+password = ""
+
+# Base URLs, referenced as {name} below.
+[targets]
+# discord-rpc-control, running as a LaunchAgent on this machine.
+# Branch is stable | ptb | canary - match DISCORD_BRANCH over there.
+discord = "http://127.0.0.1:8009/v1/voice/canary"
+# mic-api, which runs on the Linux box. Fill in the host.
+mic = "http://CHANGEME:8080/v1"
+
+[[commands]]
+name = "mute"
+phrases = ["mute", "mute me", "mute mic", "mute microphone"]
+url = "{discord}/mute/on"
+
+[[commands]]
+name = "unmute"
+# whisper reliably splits the "un-" prefix into its own word, and
+# hears it as "on"/"and" as often as "un". These variants are load
+# bearing: without them "on mute" falls through to its own "mute"
+# suffix and mutes when you asked for the opposite.
+phrases = ["unmute", "un mute", "on mute", "and mute", "unmute me"]
+url = "{discord}/mute/off"
+
+[[commands]]
+name = "deafen"
+phrases = ["deafen", "deafen me", "deafen mic"]
+url = "{discord}/deaf/on"
+
+[[commands]]
+name = "undeafen"
+phrases = ["undeafen", "un deafen", "on deafen", "and deafen"]
+url = "{discord}/deaf/off"
+
+[[commands]]
+name = "push to talk"
+phrases = ["push to talk", "push talk"]
+url = "{discord}/mode/PUSH_TO_TALK"
+
+[[commands]]
+name = "voice activity"
+phrases = ["voice activity", "open mic", "always on"]
+url = "{discord}/mode/VOICE_ACTIVITY"
+
+[[commands]]
+name = "desk mic"
+phrases = ["desk mic", "switch to desk", "use the desk mic"]
+url = "{mic}/input/set/desk"
+
+[[commands]]
+name = "lav mic"
+phrases = ["lav mic", "switch to lav", "use the lav mic", "lapel mic"]
+url = "{mic}/input/set/lav"
+
+# System media keys. `media` is play_pause, next or previous, and the
+# press goes to whichever app macOS considers to be playing - Spotify,
+# Music, a browser tab - so there is nothing about Spotify configured
+# anywhere, and nothing to keep in sync when you switch players.
+#
+# This needs Accessibility access, which is separate from the
+# microphone one: System Settings -> Privacy & Security ->
+# Accessibility, and add
+# ~/Library/Application Support/voice-control/voice-control. Without it
+# macOS silently drops the press; `voice-control media next` says so
+# outright, which is the quick way to tell that apart from a phrase
+# that did not match.
+#
+# There is one play/pause key rather than a play and a pause - the
+# keyboard has only the one, and every player treats it as a toggle. So
+# "computa, pause" while already paused starts it playing again. Saying
+# either word once is the way to use it.
+
+[[commands]]
+name = "play pause"
+phrases = ["play", "pause", "resume", "stop", "play pause", "pause music", "play music"]
+media = "play_pause"
+
+[[commands]]
+name = "next track"
+phrases = ["next", "skip", "next song", "next track", "skip song", "skip this song"]
+media = "next"
+
+# Most players read one press as "back to the start of this song" and
+# two as "the song before".
+[[commands]]
+name = "previous track"
+phrases = ["previous", "previous song", "previous track", "last song", "go back a song"]
+media = "previous"
+
+# OBS scenes. Each scene you want to reach needs its own entry - the
+# daemon can only switch to scenes named here, never to whatever it
+# thinks it heard. `scene` must match the OBS name exactly; run
+# `voice-control obs` to list them.
+
+[[commands]]
+name = "camera scene"
+phrases = ["camera", "cam", "show me", "show me the camera", "camera scene"]
+scene = "Camera Screen"
+
+[[commands]]
+name = "main scene"
+phrases = ["main", "screen", "main screen", "go to main"]
+scene = "Main Screen"
+
+# OBS sources. `source` is a source's name inside a scene, matched by
+# OBS exactly - run `voice-control obs sources` to list them.
+#
+# `visible` is show, hide, or toggle (the default).
+#
+# `scene` here says where the source lives - it is not a scene switch.
+# Leave it out and the source is looked for in whichever scene is on
+# program when you say it, which is what you want for a source that
+# appears in several. Name it, as below, when the source only exists in
+# the one scene: without it, saying "ps5" while another scene is on
+# program fails with "no source named". Sources inside a group are
+# found without naming the group.
+#
+# `show_filter` / `hide_filter` name Move filters on `scene` and turn a
+# visibility flip into an animation. The order is the part that
+# matters, and it is not symmetric:
+#
+#   show:  make the source visible, then enable show_filter
+#   hide:  enable hide_filter, wait hide_delay_ms, then hide the source
+#
+# A Move filter animates something that is on screen, so on the way in
+# the source has to exist before it can move, and on the way out it has
+# to survive until the move ends. Enabling the filter is what triggers
+# it; the plugin turns it back off when the move finishes.
+#
+# hide_delay_ms should be at least as long as the move, or the source
+# is yanked mid-animation. It defaults to 350.
+#
+# List filter names with `voice-control obs filters "Main Screen"` -
+# OBS spells them exactly, and its spelling wins over what any other
+# tool's dropdown shows.
+
+# A command that does more than one thing is a flow: a list of steps,
+# run in order, stopping at the first failure. Each step takes the same
+# fields a one-step command does, plus `wait_ms` for a step that only
+# waits. Everything above is the one-step shorthand for exactly this -
+# a command uses one form or the other, not both.
+#
+# The ps5 commands switch scene first so the animation has somewhere to
+# play: saying "ps5" from the camera scene gets you to Main Screen and
+# then brings the source in.
+
+[[commands]]
+name = "ps5"
+# whisper writes the digit about as often as the word, and splits it
+# off as its own token more often than not.
+phrases = ["ps5", "ps 5", "ps five", "playstation", "play station"]
+
+  [[commands.steps]]
+  scene = "Main Screen"
+
+  [[commands.steps]]
+  source = "Cam Link Screen"
+  scene = "Main Screen"
+  visible = "toggle"
+  show_filter = "Move-In"
+  hide_filter = "Move-Out"
+  hide_delay_ms = 350
+
+[[commands]]
+name = "show ps5"
+phrases = ["show ps5", "show ps 5", "show the ps5", "show playstation"]
+
+  [[commands.steps]]
+  scene = "Main Screen"
+
+  [[commands.steps]]
+  source = "Cam Link Screen"
+  scene = "Main Screen"
+  visible = "show"
+  show_filter = "Move-In"
+
+# No scene switch on the way out: hiding it is not a reason to move you
+# somewhere. Add a `scene` step after this one to go back to the camera
+# once it has animated away.
+[[commands]]
+name = "hide ps5"
+phrases = ["hide ps5", "hide ps 5", "hide the ps5", "hide playstation"]
+source = "Cam Link Screen"
+scene = "Main Screen"
+visible = "hide"
+hide_filter = "Move-Out"
+hide_delay_ms = 350

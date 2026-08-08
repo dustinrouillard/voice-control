@@ -1,0 +1,50 @@
+[package]
+name = "voice-control"
+version = "0.1.0"
+edition = "2024"
+description = "Offline voice control for macOS: a wake word, whisper.cpp, and a TOML table of commands"
+license = "MIT"
+repository = "https://github.com/dustinrouillard/voice-control"
+default-run = "voice-control"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+cpal = "0.18.1"
+envconfig = "0.11.1"
+futures-util = "0.3"
+# Not used directly. rustpotter pulls candle-core 0.2.2, which calls the
+# rand 0.8 API; half >= 2.5 moved its SampleUniform impls to rand 0.9, so
+# anything newer fails to compile. Pinned here so the constraint survives
+# a lockfile regeneration.
+half = "=2.4.1"
+hound = "3.5.1"
+libc = "0.2"
+objc2 = "0.6"
+# Only the classes the menu bar needs. The default feature set is the
+# whole framework, which is a lot of compile time for bindings we never
+# call.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "NSApplication", "NSRunningApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSResponder", "NSView", "NSControl", "NSButton", "NSCell", "NSEvent", "NSGraphicsContext"] }
+# Only for posting the media key events NSEvent builds. app-kit pulls
+# this in already, but without the CGEvent feature, which is the half
+# that can post one.
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGEvent", "CGEventTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSTimer", "NSDate", "NSArray", "NSObjCRuntime", "NSRunLoop", "NSGeometry"] }
+reqwest = { version = "0.12", features = ["json"] }
+rubato = "0.16.2"
+rustpotter = "3.0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11.0"
+strsim = "0.11.1"
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+toml = "1.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter", "registry", "tracing-log"] }
+voice_activity_detector = "0.2.1"
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

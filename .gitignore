@@ -1,0 +1,12 @@
+/target
+.env
+.DS_Store
+
+# Wake word takes are recordings of your own voice, and there are a lot
+# of megabytes of them. Train from them, do not commit them.
+*samples*/
+
+# Models: trained wake words, and the ggml whisper weights.
+/models
+*.rpw
+*.bin
