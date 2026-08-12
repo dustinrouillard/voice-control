@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::{Result, bail};
 use tracing::{debug, warn};
 
 use crate::config::expand_tilde;
@@ -63,14 +64,44 @@ impl Feedback {
       return;
     }
 
-    // Detached: the pipeline should never wait on audio playback.
-    match std::process::Command::new("afplay").arg(&path).spawn() {
-      Ok(mut child) => {
-        std::thread::spawn(move || {
-          let _ = child.wait();
-        });
-      }
-      Err(why) => warn!(error = %why, "failed to spawn afplay"),
+    if let Err(why) = spawn(&path) {
+      warn!(error = %why, "failed to play a cue");
     }
   }
+
+  /// Plays `<name>.wav` from the sounds directory, for a command whose
+  /// whole job is to make a noise.
+  ///
+  /// Unlike the cues this reports failure rather than warning past it.
+  /// A cue is commentary on something else that happened; here the
+  /// tone *is* the command, and a command that did nothing should say
+  /// so rather than look like it worked.
+  pub fn play_named(&self, name: &str) -> Result<()> {
+    let Some(dir) = &self.dir else {
+      bail!(
+        "there is no sounds directory - set SOUNDS_DIR to the one this \
+         repo ships"
+      );
+    };
+
+    let path = dir.join(format!("{name}.wav"));
+
+    if !path.exists() {
+      bail!("there is no {}", path.display());
+    }
+
+    spawn(&path)
+  }
+}
+
+/// Detached: the pipeline should never wait on audio playback.
+fn spawn(path: &std::path::Path) -> Result<()> {
+  let mut child =
+    std::process::Command::new("afplay").arg(path).spawn()?;
+
+  std::thread::spawn(move || {
+    let _ = child.wait();
+  });
+
+  Ok(())
 }

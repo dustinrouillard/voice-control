@@ -1,8 +1,8 @@
 # voice-control
 
 A background macOS agent that listens for **"computa, …"** and turns the
-command that follows into an HTTP request, an OBS change, or a media
-key.
+command that follows into an HTTP request, an OBS change, a media key,
+or an audio device switch.
 
 ```
 computa, mute            ->  POST :8009/v1/voice/canary/mute/on
@@ -17,6 +17,10 @@ computa, ps5             ->  OBS scene "Main Screen", then animate the
 computa, hide ps5        ->  animate "Cam Link Screen" out
 computa, skip            ->  media key: next track
 computa, play            ->  media key: play/pause
+computa, headphones      ->  default output device: AirPods
+computa, speakers        ->  default output device: the desk speakers
+computa, are you         ->  a tone back, and nothing else
+  listening?
 ```
 
 Targets are [discord-rpc-control][drc] on localhost and [mic-api][mic] on
@@ -42,8 +46,10 @@ cpal capture ──► resample 48k→16k mono ──► 3s pre-roll ring
                     "computa" ✔ → chirp
                           │
                     ┌─────┴─────┐
-                    │ LISTENING │  Silero VAD, ends on 700ms silence
-                    └─────┬─────┘     (seeded with 900ms of pre-roll)
+                    │ LISTENING │  Silero VAD: up to 2.5s for the
+                    └─────┬─────┘  command to start, then 700ms of
+                          │        silence ends it
+                          │        (seeded with 900ms of pre-roll)
                           │
                   whisper.cpp base.en  →  "computa mute"
                           │
@@ -62,6 +68,29 @@ it commits. Between them the whole utterance can be in the past by the
 time the detector says anything, so the window reaches back far enough
 to recover the wake word too. That the wake word ends up in the clip is
 fine: the matcher works over suffixes and drops it.
+
+It also means the capture starts out having *already heard speech* —
+the wake word — whatever the user does next. Ending it on trailing
+silence alone therefore closes the window about 700 ms after "computa",
+which is not long enough to say "computa", think for a beat, and then
+give the command: the first syllable arrives after the capture has
+already been sent to whisper. So silence does not end anything until
+something has been said **live**, past the end of the pre-roll. Until
+then the only clock running is `grace_ms`, and when that runs out the
+wake word is written off as a false trigger and dropped quietly.
+
+Nothing is lost in the brisk case. Said in one breath, "computa mute"
+is still being spoken when the detector commits, so its tail arrives
+live, and the hangover ends the capture as promptly as it ever did —
+the grace period only applies to a capture where nothing has been said
+yet, and there is nothing to cut short.
+
+```toml
+[listen]
+grace_ms = 2500     # how long the command may still be starting
+silence_ms = 700    # trailing silence that ends one already started
+max_ms = 8000       # ceiling on a capture, pre-roll included
+```
 
 Both stages sit behind traits (`wake::Detector`, `stt::Transcriber`), so
 swapping in [openWakeWord][oww] later touches only `src/wake/`.
@@ -207,7 +236,9 @@ new app and drop them.
 
 ```
 voice-control                    run the daemon
-voice-control devices            list input devices
+voice-control devices            list audio devices and their aliases
+voice-control output headphones  switch the default output, bare
+voice-control input "Wireless"   switch the default input, bare
 voice-control listen             wake word detections only
 voice-control transcribe f.wav   STT + matcher against a file
 voice-control run "computa ps5"  match a phrase and dispatch it
@@ -399,6 +430,114 @@ A grant belongs to the *responsible* process, so run from a terminal
 the check reflects that terminal's Accessibility rather than the
 binary's. Only the launchd copy answers for itself.
 
+### Tones
+
+`sound` plays a wav from `SOUNDS_DIR`, named without the extension:
+
+```toml
+[[commands]]
+name = "ping"
+phrases = ["ping", "hello", "hi", "are you listening", "you there"]
+sound = "ping"
+```
+
+A command whose only step is one of these does nothing else, which is
+the whole point of it — something to say to check the daemon is awake
+and hearing you, that has no side effects if it turns out you were
+talking to yourself.
+
+The generic success chirp is left off for a command that makes its own
+noise, so it answers once rather than twice. A failure still gets the
+failure tone: if the wav is missing the command has not done the one
+thing it was for, and it says so rather than sitting there silently.
+
+`ping.wav` is two taps at one pitch. Every other cue is a pair of notes
+going somewhere — rising for wake and ok, falling for fail — so a flat
+double-tap is the one shape left that cannot be mistaken for any of
+them. `scripts/make-sounds.py` generates all four.
+
+### Audio devices
+
+`output` and `input` move the system's default devices — the same thing
+as picking one in the Sound pane, done through the CoreAudio HAL
+directly. Devices are named once in a `[devices]` table and referred to
+by that name:
+
+```toml
+[devices]
+speakers = "CalDigit USB-C Pro Audio"
+headphones = "AirPods"
+microphone = "Wireless microphone"
+
+[[commands]]
+name = "headphones"
+phrases = ["headphones", "airpods", "air pods", "headset"]
+output = "headphones"
+
+[[commands]]
+name = "speakers"
+phrases = ["speakers", "speaker", "on speakers", "to speakers"]
+output = "speakers"
+```
+
+Each value is a **case-insensitive substring** of the device name,
+because the HAL spells them out in full — "Dustin's AirPods Pro #3" —
+and the pairing renames itself often enough that matching the whole
+thing would be a config edit every few months. `voice-control devices`
+lists what those substrings are matched against, with the current
+defaults and which alias lands on which device:
+
+```
+$ voice-control devices
+inputs
+  Wireless microphone  (default, microphone)
+  Cam Link 4K
+  AirPods Pro 2  (headphones)
+outputs
+  CalDigit USB-C Pro Audio  (default, speakers)
+  Mac mini Speakers
+  AirPods Pro 2  (headphones)
+```
+
+**The name must be in the table.** An alias that is merely misspelt
+matches nothing, and so does a device that is only unplugged — there is
+no way to tell those apart at the point the command runs, so the
+spelling is checked at startup instead and a typo is a load error
+naming the aliases that do exist.
+
+Alert sounds follow the output device, which is what the Sound pane
+does too. Anything that has pinned a device of its own does not: a call
+already running in Discord stays where it is, because that is macOS's
+rule and not this daemon's.
+
+**Switching the input does not move the daemon's own microphone.** cpal
+opens a device, not "whatever is default", so the capture stream stays
+where it was until the daemon restarts. `INPUT_DEVICE` is what decides
+where it listens.
+
+There is deliberately no headphones command for `input`, and adding one
+is a bad idea: selecting the AirPods microphone drops the whole
+bluetooth link into 16 kHz call mode, so the music in your ears gets
+worse in exchange for a microphone worse than the one already on the
+desk. [stop-airpods-mic][sam] exists on this machine to undo exactly
+that when macOS does it unasked — and it will undo this too, within
+about 20 ms, which is the other reason not to.
+
+[sam]: https://github.com/dustinrouillard/stop-airpods-mic
+
+The bare forms take an alias or, if it is not one, part of a device
+name — which is how you find out what to put in the table:
+
+```bash
+voice-control output headphones     # an alias from [devices]
+voice-control output "Mac mini"     # or a substring, unconfigured
+```
+
+Asking for the device that is already default is a no-op and says so.
+That is not only cosmetic: writing the property fires the HAL
+notification it was set from, and there is another agent on this
+machine listening for that one.
+
 ### Flows
 
 A command that does more than one thing is a list of steps, run in
@@ -565,7 +704,7 @@ to. Every subcommand is headless regardless.
 | --- | --- | --- |
 | `CONFIG_PATH` | `~/.config/voice-control/commands.toml` | command table |
 | `INPUT_DEVICE` | system default | case-insensitive substring of the device name |
-| `SOUNDS_DIR` | unset (silent) | directory holding `wake.wav`, `ok.wav`, `fail.wav` |
+| `SOUNDS_DIR` | unset (silent) | directory holding `wake.wav`, `ok.wav`, `fail.wav`, and any wav a `sound` command names |
 | `OBS_PASSWORD` | unset | obs-websocket password, if not in the config |
 | `DSTN_LOG` | `info` | tracing filter |
 | `TRAY` | `true` | menu bar status item |
@@ -589,7 +728,9 @@ grep "no matching command" ~/Library/Application\ Support/voice-control/logs/std
   pipeline future cannot go to a work-stealing scheduler. Everything it
   spawns - the resampler, whisper, HTTP - still lands on the runtime.
 - **Speaker loopback.** On speakers, someone in voice chat saying
-  "computa mute" will trigger it. Headphones avoid this.
+  "computa mute" will trigger it. Headphones avoid this, and "computa,
+  headphones" is now one of the things that can get you there — though
+  not while they are the ones saying it.
 - Commands are a literal phrase → a fixed action. No parameters ("set
   volume to 30") without extending the matcher.
 - `half` is pinned to `=2.4.1` in `Cargo.toml`. It is not used directly;

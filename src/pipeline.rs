@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::audio::ring::PreRoll;
-use crate::audio::vad::{Endpoint, Endpointer, WINDOW};
+use crate::audio::vad::{Endpoint, Endpointer, Timing, WINDOW};
 use crate::audio::{ms_to_samples, samples_to_ms};
 use crate::commands::{Command, match_command};
 use crate::dispatch::{Dispatcher, try_run};
@@ -62,14 +62,15 @@ impl Pipeline {
     commands: Vec<Command>,
     feedback: Feedback,
     obs: ObsConfig,
+    timing: &Timing,
     status: Arc<Status>,
   ) -> Result<Self> {
     Ok(Self {
       detector,
-      endpointer: Endpointer::new()?,
+      endpointer: Endpointer::new(timing)?,
       transcriber: Arc::new(Mutex::new(transcriber)),
       commands,
-      dispatcher: Dispatcher::new(obs)?,
+      dispatcher: Dispatcher::new(obs, feedback.clone())?,
       feedback,
       status,
       pre_roll: PreRoll::new(ms_to_samples(RING_MS)),
@@ -193,17 +194,16 @@ impl Pipeline {
     // Run the pre-roll through the VAD as well, not just into the
     // buffer. Said briskly, "computa mute" is over before the detector
     // commits, so the command lives entirely in the pre-roll - and a
-    // VAD that starts from scratch here sees nothing but silence,
-    // waits out the full no-speech timeout, and hands whisper a clip
-    // that is mostly nothing. Priming it means the speech is already
-    // accounted for and the hangover ends the capture promptly.
+    // VAD that starts from scratch here sees nothing but silence and
+    // hands whisper a clip that is mostly nothing.
     //
-    // The verdict is deliberately ignored: acting on it here would
-    // finish a capture before the caller has even left this function.
-    // At worst that costs one more 32ms window.
+    // `prime` rather than `push`, so none of this counts as the
+    // command having been started: the seed always ends with the wake
+    // word, and a hangover measured from there would end the capture
+    // before someone who paused after "computa" had said anything.
     for window in seed.chunks(WINDOW) {
       self.captured.extend_from_slice(window);
-      let _ = self.endpointer.push(window.to_vec());
+      self.endpointer.prime(window.to_vec());
     }
 
     self.state = State::Listening;
@@ -276,15 +276,21 @@ impl Pipeline {
         );
 
         let name = hit.command.name.clone();
+        // A command that plays its own tone has already answered by
+        // the time it succeeds, so the generic chirp is left off.
+        let answered = hit.command.answers_for_itself();
 
         let (cue, outcome) =
           if try_run(&self.dispatcher, hit.command).await {
-            (Cue::Ok, Outcome::Dispatched(name))
+            ((!answered).then_some(Cue::Ok), Outcome::Dispatched(name))
           } else {
-            (Cue::Fail, Outcome::Failed(name))
+            (Some(Cue::Fail), Outcome::Failed(name))
           };
 
-        self.feedback.play(cue);
+        if let Some(cue) = cue {
+          self.feedback.play(cue);
+        }
+
         self.status.finished(&transcript, outcome);
       }
       None => {

@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::commands::{Action, Command, Step};
+use crate::devices;
+use crate::feedback::Feedback;
 use crate::media;
 use crate::obs::{self, ObsConfig};
 
@@ -14,16 +16,21 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 pub struct Dispatcher {
   client: reqwest::Client,
   obs: ObsConfig,
+  feedback: Feedback,
 }
 
 impl Dispatcher {
-  pub fn new(obs: ObsConfig) -> Result<Self> {
+  pub fn new(obs: ObsConfig, feedback: Feedback) -> Result<Self> {
     let client = reqwest::Client::builder()
       .timeout(TIMEOUT)
       .build()
       .context("building the http client")?;
 
-    Ok(Self { client, obs })
+    Ok(Self {
+      client,
+      obs,
+      feedback,
+    })
   }
 
   /// Runs a command's steps in order, stopping at the first failure.
@@ -66,6 +73,38 @@ impl Dispatcher {
           .with_context(|| format!("pressing the {} key", key.as_str()))?;
 
         info!(command = %command.name, key = key.as_str(), "pressed");
+
+        Ok(())
+      }
+      // A handful of HAL property reads and one write, all of them
+      // answered from coreaudiod's own state - there is no round trip
+      // here worth handing to a blocking pool either.
+      Action::Device { direction, pattern } => {
+        let switch = devices::set_default(direction, pattern)
+          .with_context(|| {
+            format!(
+              "switching the {} device to {pattern:?}",
+              direction.as_str()
+            )
+          })?;
+
+        info!(
+          command = %command.name,
+          direction = direction.as_str(),
+          device = switch.name,
+          changed = switch.changed,
+          "set the default audio device"
+        );
+
+        Ok(())
+      }
+      Action::Sound(name) => {
+        self
+          .feedback
+          .play_named(name)
+          .with_context(|| format!("playing {name}.wav"))?;
+
+        info!(command = %command.name, sound = name, "played");
 
         Ok(())
       }

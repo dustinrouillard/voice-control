@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use strsim::jaro_winkler;
 
+use crate::audio::vad::Timing;
+use crate::devices::Direction;
 use crate::media::MediaKey;
 use crate::obs::{ObsConfig, SourceAction, Visibility};
 use tracing::warn;
@@ -23,8 +25,15 @@ pub struct CommandFile {
   pub wake: WakeConfig,
   #[serde(default)]
   pub stt: SttConfig,
+  /// How long a capture runs for.
+  #[serde(default)]
+  pub listen: Timing,
   #[serde(default)]
   pub targets: HashMap<String, String>,
+  /// Audio device aliases, referenced by name from `output` and
+  /// `input` below.
+  #[serde(default)]
+  pub devices: HashMap<String, String>,
   #[serde(default)]
   pub obs: ObsConfig,
   #[serde(default)]
@@ -115,6 +124,27 @@ pub struct Step {
   /// is nothing to name here beyond the key itself.
   #[serde(default)]
   pub media: Option<MediaKey>,
+  /// The audio output to make default - a name from the `[devices]`
+  /// table. Rewritten in place to the device pattern it stands for,
+  /// the way `url` is rewritten from `[targets]`.
+  #[serde(default)]
+  pub output: Option<String>,
+  /// A wav in `SOUNDS_DIR` to play, named without the extension.
+  ///
+  /// A command whose only step is this does nothing but answer, which
+  /// is the point of it: "computa, are you listening?" wants a noise
+  /// back and nothing else. The generic success tone is suppressed for
+  /// a command that makes its own, so it answers once rather than
+  /// twice.
+  #[serde(default)]
+  pub sound: Option<String>,
+  /// The audio input to make default, named the same way.
+  ///
+  /// This does not move the daemon's own microphone: the capture
+  /// stream was opened against a device rather than against "whatever
+  /// is default", so it stays where it is until a restart.
+  #[serde(default)]
+  pub input: Option<String>,
 }
 
 impl Default for Step {
@@ -130,6 +160,9 @@ impl Default for Step {
       hide_delay_ms: None,
       wait_ms: None,
       media: None,
+      output: None,
+      sound: None,
+      input: None,
     }
   }
 }
@@ -140,12 +173,29 @@ const DEFAULT_HIDE_DELAY: Duration = Duration::from_millis(350);
 
 /// What one step actually does.
 pub enum Action<'a> {
-  Http { method: &'a str, url: &'a str },
+  Http {
+    method: &'a str,
+    url: &'a str,
+  },
   Scene(&'a str),
   Source(SourceAction<'a>),
   Media(MediaKey),
+  /// Point one of the system's default audio devices somewhere else.
+  /// `pattern` is a case-insensitive substring of the device name.
+  Device {
+    direction: Direction,
+    pattern: &'a str,
+  },
+  /// Play a wav from the sounds directory, named without the
+  /// extension.
+  Sound(&'a str),
   Wait(Duration),
 }
+
+/// The fields a step can name an action with, for the errors about
+/// naming none of them or several.
+const ACTION_FIELDS: &str =
+  "url, scene, source, media, output, input, sound and wait_ms";
 
 impl Command {
   /// The steps to run, in order - the explicit list, or the one the
@@ -156,6 +206,16 @@ impl Command {
     } else {
       &self.steps
     }
+  }
+
+  /// Whether the command makes a noise of its own, in which case the
+  /// generic success tone is left off - answering "computa, ping" with
+  /// a ping and then a second unrelated chirp is one tone too many.
+  pub fn answers_for_itself(&self) -> bool {
+    self
+      .steps()
+      .iter()
+      .any(|step| matches!(step.action(), Action::Sound(_)))
   }
 
   /// How the command reads in a log line.
@@ -171,11 +231,29 @@ impl Command {
 
 impl Step {
   pub fn action(&self) -> Action<'_> {
-    // Checked ahead of the rest rather than as a fifth arm: a media key
-    // takes none of the other fields, so it has nothing to be
-    // ambiguous with.
+    // Checked ahead of the rest rather than as further arms: a media
+    // key and a device switch each take none of the other fields, so
+    // they have nothing to be ambiguous with.
     if let Some(key) = self.media {
       return Action::Media(key);
+    }
+
+    if let Some(pattern) = &self.output {
+      return Action::Device {
+        direction: Direction::Output,
+        pattern,
+      };
+    }
+
+    if let Some(pattern) = &self.input {
+      return Action::Device {
+        direction: Direction::Input,
+        pattern,
+      };
+    }
+
+    if let Some(name) = &self.sound {
+      return Action::Sound(name);
     }
 
     match (&self.url, &self.source, &self.scene, self.wait_ms) {
@@ -210,6 +288,9 @@ impl Step {
       && self.source.is_none()
       && self.wait_ms.is_none()
       && self.media.is_none()
+      && self.output.is_none()
+      && self.input.is_none()
+      && self.sound.is_none()
       && self.visible.is_none()
       && self.show_filter.is_none()
       && self.hide_filter.is_none()
@@ -255,6 +336,9 @@ impl Step {
       self.scene.is_some() && self.source.is_none(),
       self.wait_ms.is_some(),
       self.media.is_some(),
+      self.output.is_some(),
+      self.input.is_some(),
+      self.sound.is_some(),
     ]
     .into_iter()
     .filter(|set| *set)
@@ -262,12 +346,47 @@ impl Step {
 
     match actions {
       1 => Ok(()),
-      0 => bail!("sets none of url, scene, source, media or wait_ms"),
+      0 => bail!("sets none of {ACTION_FIELDS}"),
       _ => bail!(
-        "sets more than one of url, scene, source, media and wait_ms - \
-         a step does one thing, so split it across steps"
+        "sets more than one of {ACTION_FIELDS} - a step does one \
+         thing, so split it across steps"
       ),
     }
+  }
+
+  /// Rewrites `output = "headphones"` into the device pattern the
+  /// `[devices]` table gives that name.
+  ///
+  /// Aliases only, with no literal fallback: a device name that is
+  /// wrong matches nothing, and nothing is exactly what a command
+  /// naming a device that is currently unplugged also does - so a typo
+  /// would stay invisible until the day you said the words and
+  /// wondered why. Requiring the name to exist here moves that to
+  /// startup.
+  fn resolve_devices(
+    &mut self,
+    devices: &HashMap<String, String>,
+  ) -> Result<()> {
+    let fields =
+      [("output", &mut self.output), ("input", &mut self.input)];
+
+    for (field, value) in fields {
+      let Some(alias) = value else {
+        continue;
+      };
+
+      let Some(pattern) = devices.get(alias.as_str()) else {
+        bail!(
+          "names {field} device {alias:?}, which the [devices] table \
+           does not have{}",
+          known(devices)
+        );
+      };
+
+      *alias = pattern.clone();
+    }
+
+    Ok(())
   }
 
   fn expand_targets(
@@ -304,6 +423,10 @@ impl Step {
       Action::Http { method, url } => format!("{method} {url}"),
       Action::Scene(scene) => format!("obs scene {scene:?}"),
       Action::Media(key) => format!("media key {}", key.as_str()),
+      Action::Device { direction, pattern } => {
+        format!("{} device {pattern:?}", direction.as_str())
+      }
+      Action::Sound(name) => format!("play {name}.wav"),
       Action::Wait(delay) => format!("wait {}ms", delay.as_millis()),
       Action::Source(action) => {
         let mut target = match action.scene {
@@ -334,6 +457,19 @@ impl Step {
       }
     }
   }
+}
+
+/// The names the `[devices]` table does have, for the error about a
+/// name it does not.
+fn known(devices: &HashMap<String, String>) -> String {
+  if devices.is_empty() {
+    return " (there is no [devices] table)".into();
+  }
+
+  let mut names: Vec<&str> = devices.keys().map(String::as_str).collect();
+  names.sort_unstable();
+
+  format!(" - it has {}", names.join(", "))
 }
 
 fn default_wake_model() -> String {
@@ -392,14 +528,15 @@ impl CommandFile {
       bail!("{} defines no commands", path.display());
     }
 
-    file.expand_targets()?;
+    file.resolve()?;
 
     Ok(file)
   }
 
-  /// Rewrites `{discord}/mute/on` into a full URL using `[targets]`,
-  /// and checks every step names exactly one thing to do.
-  fn expand_targets(&mut self) -> Result<()> {
+  /// Rewrites `{discord}/mute/on` into a full URL using `[targets]`
+  /// and `output = "headphones"` into a device pattern using
+  /// `[devices]`, and checks every step names exactly one thing to do.
+  fn resolve(&mut self) -> Result<()> {
     for command in &mut self.commands {
       let name = command.name.clone();
 
@@ -422,6 +559,7 @@ impl CommandFile {
         step
           .validate()
           .and_then(|()| step.expand_targets(&self.targets))
+          .and_then(|()| step.resolve_devices(&self.devices))
           .with_context(|| {
             format!("command {name:?}, step {}", index + 1)
           })?;
@@ -669,7 +807,7 @@ mod tests {
   fn every_example_phrase_maps_to_its_own_command() {
     let raw = std::fs::read_to_string("commands.example.toml").unwrap();
     let mut file: CommandFile = toml::from_str(&raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     let mut problems = Vec::new();
 
@@ -702,7 +840,7 @@ mod tests {
     "#;
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     assert!(matches!(
       file.commands[0].steps()[0].action(),
@@ -733,6 +871,182 @@ mod tests {
     assert_eq!(file.commands[1].step.media, Some(MediaKey::PlayPause));
   }
 
+  /// The alias is what the config says; the device pattern is what
+  /// reaches the HAL. Nothing downstream of the load should still be
+  /// holding the alias.
+  #[test]
+  fn a_device_step_resolves_its_alias() {
+    let raw = r#"
+      [devices]
+      headphones = "AirPods"
+      microphone = "Wireless microphone"
+
+      [[commands]]
+      name = "headphones"
+      phrases = ["headphones"]
+      output = "headphones"
+
+      [[commands]]
+      name = "wireless mic"
+      phrases = ["wireless mic"]
+      input = "microphone"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    assert!(matches!(
+      file.commands[0].steps()[0].action(),
+      Action::Device {
+        direction: Direction::Output,
+        pattern: "AirPods"
+      }
+    ));
+    assert!(matches!(
+      file.commands[1].steps()[0].action(),
+      Action::Device {
+        direction: Direction::Input,
+        pattern: "Wireless microphone"
+      }
+    ));
+
+    assert_eq!(file.commands[0].target(), "output device \"AirPods\"");
+    assert_eq!(
+      file.commands[1].target(),
+      "input device \"Wireless microphone\""
+    );
+  }
+
+  /// A command that makes its own noise is the one kind that should
+  /// not also get the generic success chirp.
+  #[test]
+  fn a_sound_step_answers_for_itself() {
+    let raw = r#"
+      [[commands]]
+      name = "ping"
+      phrases = ["ping", "hello"]
+      sound = "ping"
+
+      [[commands]]
+      name = "mute"
+      phrases = ["mute"]
+      url = "http://x/mute/on"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    assert!(matches!(
+      file.commands[0].steps()[0].action(),
+      Action::Sound("ping")
+    ));
+    assert_eq!(file.commands[0].target(), "play ping.wav");
+    assert!(file.commands[0].answers_for_itself());
+    assert!(!file.commands[1].answers_for_itself());
+  }
+
+  /// "hi" is two letters, which is short enough for the fuzzy matcher
+  /// to find it inside things that are not it. Exact matching runs
+  /// first and over suffixes, which is what keeps it in its lane.
+  #[test]
+  fn a_two_letter_phrase_does_not_swallow_longer_ones() {
+    let raw = std::fs::read_to_string("commands.example.toml").unwrap();
+    let mut file: CommandFile = toml::from_str(&raw).unwrap();
+    file.resolve().unwrap();
+
+    for transcript in ["computa hi", "computa hello", "computa ping"] {
+      let hit = match_command(&file.commands, transcript)
+        .unwrap_or_else(|| panic!("no match for {transcript:?}"));
+      assert_eq!(hit.command.name, "ping", "for {transcript:?}");
+    }
+
+    for transcript in [
+      "computa hide ps5",
+      "computa headphones",
+      "computa hide playstation",
+    ] {
+      let hit = match_command(&file.commands, transcript)
+        .unwrap_or_else(|| panic!("no match for {transcript:?}"));
+      assert_ne!(hit.command.name, "ping", "for {transcript:?}");
+    }
+  }
+
+  /// A device that is merely unplugged matches nothing too, so a
+  /// misspelt alias would otherwise stay invisible until the day you
+  /// said the words.
+  #[test]
+  fn an_unknown_device_alias_names_the_ones_that_exist() {
+    let raw = r#"
+      [devices]
+      speakers = "CalDigit"
+      headphones = "AirPods"
+
+      [[commands]]
+      name = "headphones"
+      phrases = ["headphones"]
+      output = "headfones"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("headfones"), "{why}");
+    assert!(why.contains("headphones, speakers"), "{why}");
+  }
+
+  #[test]
+  fn rejects_a_device_step_without_a_devices_table() {
+    let raw = r#"
+      [[commands]]
+      name = "headphones"
+      phrases = ["headphones"]
+      output = "headphones"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("no [devices] table"), "{why}");
+  }
+
+  /// Moving the output and the input are two things, and a config that
+  /// asks for both in one step has no say in which order they happen.
+  #[test]
+  fn rejects_a_step_that_sets_both_output_and_input() {
+    let raw = r#"
+      [devices]
+      headphones = "AirPods"
+
+      [[commands]]
+      name = "headphones"
+      phrases = ["headphones"]
+      output = "headphones"
+      input = "headphones"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+
+    assert!(file.resolve().is_err());
+  }
+
+  #[test]
+  fn rejects_a_command_with_both_output_and_scene() {
+    let raw = r#"
+      [devices]
+      speakers = "CalDigit"
+
+      [[commands]]
+      name = "confused"
+      phrases = ["x"]
+      output = "speakers"
+      scene = "Main Screen"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+
+    assert!(file.resolve().is_err());
+  }
+
   #[test]
   fn rejects_a_command_with_both_media_and_scene() {
     let raw = r#"
@@ -745,7 +1059,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -768,7 +1082,7 @@ mod tests {
   fn playstation_is_not_heard_as_play() {
     let raw = std::fs::read_to_string("commands.example.toml").unwrap();
     let mut file: CommandFile = toml::from_str(&raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     for transcript in [
       "computa playstation",
@@ -804,7 +1118,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -817,7 +1131,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   fn source_action(raw: &str) -> SourceAction<'_> {
@@ -825,7 +1139,7 @@ mod tests {
     // life of a test.
     let file: &'static mut CommandFile =
       Box::leak(Box::new(toml::from_str(raw).unwrap()));
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     match file.commands[0].steps()[0].action() {
       Action::Source(action) => action,
@@ -920,7 +1234,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   /// One-way commands are the exception: a `show` never has to undo
@@ -938,7 +1252,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_ok());
+    assert!(file.resolve().is_ok());
   }
 
   #[test]
@@ -953,7 +1267,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -1005,7 +1319,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -1020,7 +1334,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   /// The flow the ps5 commands use: get to the scene, then animate
@@ -1046,7 +1360,7 @@ mod tests {
     "#;
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     let steps = file.commands[0].steps();
     assert_eq!(steps.len(), 3);
@@ -1101,7 +1415,7 @@ mod tests {
     "#;
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     assert_eq!(
       file.commands[0].steps()[0].url.as_deref().unwrap(),
@@ -1126,7 +1440,7 @@ mod tests {
     "#;
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
-    let why = format!("{:#}", file.expand_targets().unwrap_err());
+    let why = format!("{:#}", file.resolve().unwrap_err());
 
     assert!(why.contains("step 2"), "{why}");
   }
@@ -1145,7 +1459,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   /// Both forms at once reads as if the shorthand were a fourth step,
@@ -1164,7 +1478,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -1177,7 +1491,7 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 
   #[test]
@@ -1193,7 +1507,7 @@ mod tests {
     "#;
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
-    file.expand_targets().unwrap();
+    file.resolve().unwrap();
 
     assert_eq!(
       file.commands[0].steps()[0].url.as_deref().unwrap(),
@@ -1212,6 +1526,6 @@ mod tests {
 
     let mut file: CommandFile = toml::from_str(raw).unwrap();
 
-    assert!(file.expand_targets().is_err());
+    assert!(file.resolve().is_err());
   }
 }

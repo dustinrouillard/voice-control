@@ -13,6 +13,22 @@ avg_threshold = 0.2
 [stt]
 model = "~/.config/voice-control/ggml-base.en-q5_1.bin"
 
+# How long a capture runs for, in milliseconds.
+[listen]
+# How long after the wake word the command may still be starting.
+# Saying "computa", pausing to think, and then giving the command is
+# normal, and nothing ends the capture until either something is said
+# or this runs out - at which point the wake word is treated as a false
+# trigger and dropped quietly.
+grace_ms = 2500
+# Trailing silence that ends a command, once one has been heard. This
+# is what decides how long a pause mid-sentence may be, so raising it
+# costs latency on every command.
+silence_ms = 700
+# Absolute ceiling on one capture, pre-roll included. Has to leave room
+# for grace_ms plus the longest thing you would actually say.
+max_ms = 8000
+
 # obs-websocket. Tools -> WebSocket Server Settings in OBS.
 # wss:// works too, for an OBS on another machine.
 [obs]
@@ -28,6 +44,17 @@ password = ""
 discord = "http://127.0.0.1:8009/v1/voice/canary"
 # mic-api, which runs on the Linux box. Fill in the host.
 mic = "http://CHANGEME:8080/v1"
+
+# Audio devices, referenced by name from `output` and `input` below.
+#
+# Each value is a case-insensitive substring of the device name, so
+# "AirPods" matches "Dustin's AirPods Pro #3" and keeps matching when
+# the pairing renames itself. `voice-control devices` lists everything
+# here is matched against, and says which alias lands on which device.
+[devices]
+speakers = "CalDigit USB-C Pro Audio"
+headphones = "AirPods"
+microphone = "Wireless microphone"
 
 [[commands]]
 name = "mute"
@@ -107,6 +134,64 @@ media = "next"
 name = "previous track"
 phrases = ["previous", "previous song", "previous track", "last song", "go back a song"]
 media = "previous"
+
+# `sound` plays a wav from SOUNDS_DIR, named without the extension.
+# A command whose only step is one does nothing else, which is the
+# whole point of this one: something to say to check the daemon is
+# awake and hearing you, that has no side effects if it turns out you
+# were talking to yourself.
+#
+# The generic success chirp is suppressed for a command that makes its
+# own noise, so this answers once rather than twice.
+
+[[commands]]
+name = "ping"
+phrases = [
+  "ping",
+  "hello",
+  "hi",
+  "are you listening",
+  "are you there",
+  "you there",
+]
+sound = "ping"
+
+# Audio devices. `output` moves the system's default output - the same
+# thing as picking a device in the Sound pane - and `input` moves the
+# default input. Both take a name from the [devices] table rather than
+# a device name, so the name is written once and the phrases point at
+# it; a name that is not in the table is an error at startup rather
+# than a command that quietly does nothing.
+#
+# Alert sounds follow the output. Anything that has pinned a device of
+# its own does not - that is macOS's rule, not this daemon's - so a
+# call already running in Discord stays where it is.
+#
+# There is deliberately no headphones command for `input`. The AirPods
+# microphone drops the whole link into 16 kHz call mode, which makes
+# the music in your ears worse to get a microphone worse than the one
+# already on the desk.
+#
+# Switching the input does not move this daemon's own microphone
+# either: the capture stream was opened against a device, not against
+# whatever is default, so it stays there until a restart.
+
+[[commands]]
+name = "speakers"
+phrases = ["speakers", "speaker", "on speakers", "to speakers"]
+output = "speakers"
+
+[[commands]]
+name = "headphones"
+# whisper writes the brand about as often as the word, and splits it
+# in two about half the time.
+phrases = ["headphones", "airpods", "air pods", "headset", "on headphones"]
+output = "headphones"
+
+[[commands]]
+name = "wireless mic"
+phrases = ["wireless mic", "wireless microphone", "use the wireless mic"]
+input = "microphone"
 
 # OBS scenes. Each scene you want to reach needs its own entry - the
 # daemon can only switch to scenes named here, never to whatever it

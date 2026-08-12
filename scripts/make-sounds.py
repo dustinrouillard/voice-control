@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the three feedback cues into sounds/.
+"""Generate the feedback cues into sounds/.
 
 Kept as a script rather than committed-only binaries so the tones can
 be retuned without hunting for an audio editor. Run from the repo root:
@@ -29,6 +29,11 @@ def tone(freq, ms, fade_ms=8):
     return out
 
 
+def gap(ms):
+    """A real pause, so a repeated note reads as two and not as one."""
+    return [0.0] * int(RATE * ms / 1000)
+
+
 def write(name, samples):
     path = os.path.join("sounds", name)
 
@@ -56,3 +61,8 @@ write("ok.wav", tone(660, 80) + tone(990, 110))
 
 # Descending, lower: "did not understand".
 write("fail.wav", tone(440, 110) + tone(311, 150))
+
+# Two taps at one pitch: "yes, I am here". Every other cue is a pair of
+# notes going somewhere, so a flat double-tap is the one shape left
+# that cannot be mistaken for any of them at a glance.
+write("ping.wav", tone(1318, 55) + gap(45) + tone(1318, 55))

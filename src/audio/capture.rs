@@ -236,25 +236,3 @@ fn make_resampler(native_rate: u32) -> Result<SincFixedIn<f32>> {
 
   Ok(resampler)
 }
-
-/// Lists input devices, for `voice-control devices`.
-pub fn list_devices() -> Result<Vec<String>> {
-  let host = cpal::default_host();
-  let default = host.default_input_device().map(|d| d.to_string());
-
-  let names = host
-    .input_devices()
-    .context("enumerating input devices")?
-    .map(|device| {
-      let name = device.to_string();
-
-      if Some(&name) == default.as_ref() {
-        format!("{name} (default)")
-      } else {
-        name
-      }
-    })
-    .collect();
-
-  Ok(names)
-}

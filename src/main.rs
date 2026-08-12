@@ -24,6 +24,7 @@ use crate::wake::rustpotter::RustpotterDetector;
 pub mod audio;
 pub mod commands;
 pub mod config;
+pub mod devices;
 pub mod dispatch;
 pub mod feedback;
 pub mod media;
@@ -42,7 +43,10 @@ const USAGE: &str = "\
 usage: voice-control [command]
 
   (none)              run the daemon
-  devices             list input devices
+  devices             list audio devices, with the [devices] aliases
+  output <name>       switch the default output - an alias or part of
+                      a device name
+  input <name>        switch the default input, named the same way
   listen              print wake word detections only, no STT or HTTP
   transcribe <file>   transcribe a 16kHz mono wav and match it
   run <phrase>        match a phrase and dispatch it, as if you said it
@@ -79,7 +83,13 @@ fn main() -> Result<()> {
 
   let result = match args.first().map(String::as_str) {
     None => run(config),
-    Some("devices") => devices(),
+    Some("devices") => devices(&config),
+    Some("output") => {
+      switch(&config, devices::Direction::Output, args.get(1))
+    }
+    Some("input") => {
+      switch(&config, devices::Direction::Input, args.get(1))
+    }
     Some("listen") => blocking(listen(config)),
     Some("transcribe") => blocking(transcribe(config, args.get(1))),
     Some("run") => blocking(run_phrase(config, args.get(1))),
@@ -145,6 +155,7 @@ fn run(config: Config) -> Result<()> {
     file.commands,
     Feedback::new(&config.sounds_dir),
     file.obs,
+    &file.listen,
     Arc::clone(&status),
   )?;
 
@@ -206,9 +217,90 @@ fn blocking<F: std::future::Future<Output = Result<()>>>(
     .block_on(future)
 }
 
-fn devices() -> Result<()> {
-  for name in capture::list_devices()? {
-    println!("{name}");
+/// Every audio device, both directions, with the current defaults and
+/// the `[devices]` aliases pointing at each - the way `obs sources`
+/// shows which sources are wired up, and for the same reason: an alias
+/// that resolves to nothing is silent until you say the words.
+///
+/// The config is read if it parses and ignored if it does not, since
+/// this is also what you run before there is one.
+fn devices(config: &Config) -> Result<()> {
+  let aliases = CommandFile::load(&config.resolved_config_path())
+    .map(|file| file.devices)
+    .unwrap_or_default();
+
+  let all = devices::list()?;
+
+  for direction in [devices::Direction::Input, devices::Direction::Output]
+  {
+    let current = devices::current(direction).ok();
+
+    println!("{}s", direction.as_str());
+
+    for device in all.iter().filter(|device| device.does(direction)) {
+      let mut tags = Vec::new();
+
+      if current.as_ref().is_some_and(|it| it.id == device.id) {
+        tags.push("default".to_string());
+      }
+
+      for (alias, pattern) in &aliases {
+        if devices::matches(&device.name, pattern) {
+          tags.push(alias.clone());
+        }
+      }
+
+      if tags.is_empty() {
+        println!("  {}", device.name);
+      } else {
+        println!("  {}  ({})", device.name, tags.join(", "));
+      }
+    }
+  }
+
+  // An alias matching nothing at all is either a device that is not
+  // plugged in - normal, and the command will start working when it
+  // is - or a typo that never will. Nothing here can tell those apart,
+  // so say both.
+  for (alias, pattern) in &aliases {
+    if !all
+      .iter()
+      .any(|device| devices::matches(&device.name, pattern))
+    {
+      println!(
+        "\n!! nothing matches {alias} = {pattern:?} - fine if it is \
+         only unplugged, a typo otherwise"
+      );
+    }
+  }
+
+  Ok(())
+}
+
+/// Points one of the system's defaults at a device, without going
+/// through a command. `name` is a `[devices]` alias if there is one by
+/// that name, and part of a device name otherwise - which is how you
+/// find out what to put in the table in the first place.
+fn switch(
+  config: &Config,
+  direction: devices::Direction,
+  name: Option<&String>,
+) -> Result<()> {
+  let Some(name) = name else {
+    bail!("usage: voice-control {} <name>", direction.as_str());
+  };
+
+  let pattern = CommandFile::load(&config.resolved_config_path())
+    .ok()
+    .and_then(|file| file.devices.get(name).cloned())
+    .unwrap_or_else(|| name.clone());
+
+  let switch = devices::set_default(direction, &pattern)?;
+
+  if switch.changed {
+    println!("{} is now {:?}", direction.as_str(), switch.name);
+  } else {
+    println!("{} was already {:?}", direction.as_str(), switch.name);
   }
 
   Ok(())
@@ -349,6 +441,7 @@ async fn replay(config: Config, path: Option<&String>) -> Result<()> {
     file.commands,
     Feedback::new(&config.sounds_dir),
     file.obs,
+    &file.listen,
     Arc::new(Status::new()),
   )?;
 
@@ -641,7 +734,9 @@ async fn run_phrase(
     hit.command.target()
   );
 
-  Dispatcher::new(file.obs)?.run(hit.command).await
+  Dispatcher::new(file.obs, Feedback::new(&config.sounds_dir))?
+    .run(hit.command)
+    .await
 }
 
 fn read_wav(path: &str) -> Result<Vec<f32>> {
