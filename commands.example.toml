@@ -4,11 +4,21 @@
 #   launchctl kickstart -k gui/$(id -u)/com.dstn.voice-control
 
 [wake]
-model = "~/.config/voice-control/computa.rpw"
-# Raise these if it triggers while you are just talking, lower them if
-# it misses you. Tune with `voice-control listen`.
+# The openWakeWord classifier for the word itself.
+model = "~/.config/voice-control/computa.onnx"
+# openWakeWord's shared feature extractors: the same two files
+# whatever the wake word is, so they rarely need changing.
+melspectrogram = "~/.config/voice-control/melspectrogram.onnx"
+embedding = "~/.config/voice-control/embedding_model.onnx"
+# Raise this if it triggers while you are just talking, lower it if it
+# misses you. `voice-control score` over a directory of recordings is
+# a better guide than guessing.
 threshold = 0.5
-avg_threshold = 0.2
+# Consecutive 80 ms hops that have to clear the threshold before this
+# counts as the wake word. Costs `patience` x 80 ms of latency, which
+# the pre-roll covers, and drops the false positives that only glance
+# off the model for a frame or two.
+patience = 2
 
 [stt]
 model = "~/.config/voice-control/ggml-base.en-q5_1.bin"

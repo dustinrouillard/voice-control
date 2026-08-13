@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """Trim wake word recordings down to the word itself.
 
-`rustpotter-cli record` runs until you hit ctrl-c, so a take is
-typically two or three seconds of room tone with half a second of
-speech somewhere inside it. rustpotter builds its reference template
-from the whole file, so those takes compare mostly-silence against
-mostly-silence at different offsets and score near zero -- even
-against themselves.
+A take recorded by hand is typically two or three seconds of room tone
+with half a second of speech somewhere inside it. Nothing in the daemon
+needs these cropped any more -- openWakeWord scores a rolling window
+and does not care what surrounds the word -- but a trainer being handed
+samples of a new wake word generally does, and so does anyone reading
+through a directory of takes.
 
 This crops each take to the speech, converts to the 16 kHz mono the
 detector runs at, and writes to an output directory. Run from the repo
 root:
 
     python3 scripts/trim-samples.py samples samples-trimmed
-
-Then build from the trimmed copies:
-
-    rustpotter-cli build --name computa \\
-      --path ~/.config/voice-control/computa.rpw samples-trimmed/*.wav
 """
 
 import array
@@ -157,10 +152,9 @@ def main():
         kept.append((name, before, after, cropped))
 
     # A take that trims to far longer than the rest means the energy
-    # gate never closed — background noise, a cough, a second word. Its
-    # template is the wrong shape, and rustpotter averages templates
-    # together, so one bad take degrades every comparison. Three such
-    # takes out of 24 were enough to take detection from 15/24 to 4/24.
+    # gate never closed — background noise, a cough, a second word.
+    # Whatever is fed these, a sample that is mostly not the wake word
+    # is teaching it the wrong thing, so they are worth flagging.
     lengths = sorted(a for _, _, a, _ in kept)
     median = lengths[len(lengths) // 2] if lengths else 0
     limit = median * 1.8

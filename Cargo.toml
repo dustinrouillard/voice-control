@@ -13,11 +13,6 @@ base64 = "0.23.1"
 cpal = "0.18.1"
 envconfig = "0.11.1"
 futures-util = "0.3"
-# Not used directly. rustpotter pulls candle-core 0.2.2, which calls the
-# rand 0.8 API; half >= 2.5 moved its SampleUniform impls to rand 0.9, so
-# anything newer fails to compile. Pinned here so the constraint survives
-# a lockfile regeneration.
-half = "=2.4.1"
 hound = "3.5.1"
 libc = "0.2"
 objc2 = "0.6"
@@ -30,9 +25,13 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 # that can post one.
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "objc2", "CGEvent", "CGEventTypes"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSTimer", "NSDate", "NSArray", "NSObjCRuntime", "NSRunLoop", "NSGeometry"] }
+# The wake word runs on ONNX Runtime, which is already here:
+# voice_activity_detector links the same crate for silero. Pinned to
+# the version it asks for - two ort versions in one binary would mean
+# two copies of the runtime.
+ort = "=2.0.0-rc.10"
 reqwest = { version = "0.12", features = ["json"] }
 rubato = "0.16.2"
-rustpotter = "3.0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"

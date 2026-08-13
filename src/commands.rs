@@ -42,18 +42,22 @@ pub struct CommandFile {
 
 #[derive(Debug, Deserialize)]
 pub struct WakeConfig {
+  /// The openWakeWord classifier for the word itself.
   #[serde(default = "default_wake_model")]
   pub model: String,
+  /// openWakeWord's shared feature extractors. The same two files for
+  /// every wake word, so they are named separately from the model and
+  /// almost never need changing.
+  #[serde(default = "default_melspectrogram_model")]
+  pub melspectrogram: String,
+  #[serde(default = "default_embedding_model")]
+  pub embedding: String,
   #[serde(default = "default_threshold")]
   pub threshold: f32,
-  #[serde(default = "default_avg_threshold")]
-  pub avg_threshold: f32,
-  /// Fire as soon as enough partial scores agree, rather than waiting
-  /// for the score to peak. Costs a little accuracy and buys back a
-  /// few hundred milliseconds of latency, which matters more here
-  /// because the transcription stage re-checks the result anyway.
-  #[serde(default = "default_eager")]
-  pub eager: bool,
+  /// Consecutive 80 ms hops that must clear `threshold` before this
+  /// counts as the wake word.
+  #[serde(default = "default_patience")]
+  pub patience: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -473,7 +477,15 @@ fn known(devices: &HashMap<String, String>) -> String {
 }
 
 fn default_wake_model() -> String {
-  "~/.config/voice-control/computa.rpw".into()
+  "~/.config/voice-control/computa.onnx".into()
+}
+
+fn default_melspectrogram_model() -> String {
+  "~/.config/voice-control/melspectrogram.onnx".into()
+}
+
+fn default_embedding_model() -> String {
+  "~/.config/voice-control/embedding_model.onnx".into()
 }
 
 fn default_stt_model() -> String {
@@ -484,12 +496,8 @@ fn default_threshold() -> f32 {
   0.5
 }
 
-fn default_avg_threshold() -> f32 {
-  0.2
-}
-
-fn default_eager() -> bool {
-  true
+fn default_patience() -> usize {
+  2
 }
 
 fn default_method() -> String {
@@ -500,9 +508,10 @@ impl Default for WakeConfig {
   fn default() -> Self {
     Self {
       model: default_wake_model(),
+      melspectrogram: default_melspectrogram_model(),
+      embedding: default_embedding_model(),
       threshold: default_threshold(),
-      avg_threshold: default_avg_threshold(),
-      eager: default_eager(),
+      patience: default_patience(),
     }
   }
 }

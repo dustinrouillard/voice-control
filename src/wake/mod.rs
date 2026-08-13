@@ -1,4 +1,4 @@
-pub mod rustpotter;
+pub mod oww;
 
 /// A wake word detection.
 #[derive(Debug, Clone)]

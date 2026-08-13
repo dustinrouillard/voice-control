@@ -19,7 +19,7 @@ use crate::status::Status;
 use crate::stt::Transcriber;
 use crate::stt::whisper::WhisperTranscriber;
 use crate::wake::Detector;
-use crate::wake::rustpotter::RustpotterDetector;
+use crate::wake::oww::{CHUNK, OpenWakeWordDetector};
 
 pub mod audio;
 pub mod commands;
@@ -48,6 +48,10 @@ usage: voice-control [command]
                       a device name
   input <name>        switch the default input, named the same way
   listen              print wake word detections only, no STT or HTTP
+  record <dir>        record the microphone to wavs, logging any wake
+                      word hits - leave it running through a film to
+                      collect the audio that sets it off
+  score <file>...     print the peak wake word score of each wav
   transcribe <file>   transcribe a 16kHz mono wav and match it
   run <phrase>        match a phrase and dispatch it, as if you said it
   replay <file>       run a 16kHz mono wav through the whole pipeline
@@ -91,6 +95,8 @@ fn main() -> Result<()> {
       switch(&config, devices::Direction::Input, args.get(1))
     }
     Some("listen") => blocking(listen(config)),
+    Some("record") => blocking(record(config, args.get(1))),
+    Some("score") => blocking(score(config, &args[1..])),
     Some("transcribe") => blocking(transcribe(config, args.get(1))),
     Some("run") => blocking(run_phrase(config, args.get(1))),
     Some("replay") => blocking(replay(config, args.get(1))),
@@ -137,12 +143,7 @@ fn run(config: Config) -> Result<()> {
     "loaded configuration"
   );
 
-  let detector = RustpotterDetector::load(
-    &file.wake.model,
-    file.wake.threshold,
-    file.wake.avg_threshold,
-    file.wake.eager,
-  )?;
+  let detector = wake_detector(&file)?;
   let transcriber =
     WhisperTranscriber::load(&file.stt.model, &file.vocabulary())?;
 
@@ -306,18 +307,24 @@ fn switch(
   Ok(())
 }
 
-/// Wake word only: no model loading beyond rustpotter, no HTTP. Use
-/// this to tune `threshold` / `avg_threshold`.
+/// Builds the wake word detector from the `[wake]` table. Three
+/// subcommands need one and none of them care how it is put together.
+fn wake_detector(file: &CommandFile) -> Result<OpenWakeWordDetector> {
+  OpenWakeWordDetector::load(
+    &file.wake.model,
+    &file.wake.melspectrogram,
+    &file.wake.embedding,
+    file.wake.threshold,
+    file.wake.patience,
+  )
+}
+
+/// Wake word only: no whisper, no HTTP. Use this to tune `threshold`.
 async fn listen(config: Config) -> Result<()> {
   let path = config.resolved_config_path();
   let file = CommandFile::load(&path)?;
 
-  let mut detector = RustpotterDetector::load(
-    &file.wake.model,
-    file.wake.threshold,
-    file.wake.avg_threshold,
-    file.wake.eager,
-  )?;
+  let mut detector = wake_detector(&file)?;
 
   let (_capture, mut audio) = capture::start(&config.input_device)?;
   let frame_size = detector.frame_size();
@@ -387,6 +394,249 @@ fn bar(peak: f32) -> String {
   format!("  {}", "#".repeat(width))
 }
 
+/// Seconds of audio in each wav `record` writes. Short enough that a
+/// hit is quick to find inside one, long enough not to litter.
+const SEGMENT_SECS: usize = 60;
+
+/// Records the microphone to a directory of wavs, scoring every hop on
+/// the way past.
+///
+/// This is for the false positives. Leave it running through whatever
+/// sets the daemon off and every hit is printed with the file and
+/// offset it happened at, so the clip that did it can be pulled out
+/// and listened to - and the whole directory is then negative data to
+/// re-tune the threshold against, or to retrain the model on.
+async fn record(config: Config, dir: Option<&String>) -> Result<()> {
+  let Some(dir) = dir else {
+    bail!("usage: voice-control record <dir>");
+  };
+
+  let dir = config::expand_tilde(dir);
+  std::fs::create_dir_all(&dir)
+    .with_context(|| format!("creating {}", dir.display()))?;
+
+  let file = CommandFile::load(&config.resolved_config_path())?;
+  let mut detector = wake_detector(&file)?;
+
+  let (_capture, mut audio) = capture::start(&config.input_device)?;
+
+  let first = next_index(&dir)?;
+  let mut index = first;
+  let (mut path, mut writer) = open_segment(&dir, index)?;
+  let segment = SEGMENT_SECS * SAMPLE_RATE as usize;
+  let mut recorded = 0_usize;
+
+  let mut pending: Vec<f32> = Vec::new();
+  let mut hits = 0_u32;
+  let mut peak = 0.0_f32;
+  let mut meter = tokio::time::interval(Duration::from_secs(30));
+  let mut elapsed = 0_u64;
+
+  info!(dir = %dir.display(), "recording - ctrl-c to stop");
+
+  loop {
+    tokio::select! {
+      chunk = audio.recv() => {
+        let Some(chunk) = chunk else { break };
+
+        for &sample in &chunk {
+          peak = peak.max(sample.abs());
+          // i16 rather than f32: these files exist to be listened to
+          // and trained on, and there are going to be hours of them.
+          let sample = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+          writer.write_sample(sample).context("writing a sample")?;
+        }
+
+        recorded += chunk.len();
+        pending.extend_from_slice(&chunk);
+
+        while pending.len() >= CHUNK {
+          let frame: Vec<f32> = pending.drain(..CHUNK).collect();
+
+          match detector.advance(&frame) {
+            Ok((score, true)) => {
+              hits += 1;
+              // The detector runs a hop or so behind the writer, which
+              // is well inside the second this is rounded to.
+              println!(
+                "{hits:>3}  {}  {:>6.1}s  score {score:.3}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                recorded as f32 / SAMPLE_RATE as f32,
+              );
+            }
+            Ok((_, false)) => {}
+            Err(why) => warn!(error = ?why, "scoring failed"),
+          }
+        }
+
+        if recorded >= segment {
+          writer.finalize().context("finalising a segment")?;
+          index += 1;
+          (path, writer) = open_segment(&dir, index)?;
+          recorded = 0;
+        }
+      }
+      _ = meter.tick() => {
+        elapsed += 30;
+        // The first tick fires immediately, before anything has been
+        // heard, and reporting silence then would be a lie.
+        if elapsed > 30 {
+          println!(
+            "  {}m recorded, {hits} hit(s), level {peak:.3}",
+            elapsed / 60
+          );
+        }
+        peak = 0.0;
+      }
+      _ = tokio::signal::ctrl_c() => break,
+    }
+  }
+
+  writer.finalize().context("finalising the last segment")?;
+
+  println!(
+    "\n{hits} hit(s) across {} file(s)",
+    // Counted from where this session started rather than from what is
+    // in the directory now, since a later run appends to it.
+    index - first + 1
+  );
+  println!("wrote {}", dir.display());
+
+  Ok(())
+}
+
+/// The number to give the next segment, so a second session appends to
+/// a directory rather than overwriting the first one.
+fn next_index(dir: &std::path::Path) -> Result<usize> {
+  let mut next = 1;
+
+  for entry in std::fs::read_dir(dir)
+    .with_context(|| format!("reading {}", dir.display()))?
+  {
+    let name = entry?.file_name();
+    let Some(name) = name.to_str() else { continue };
+
+    let Some(number) = name
+      .strip_prefix("audio-")
+      .and_then(|rest| rest.strip_suffix(".wav"))
+      .and_then(|number| number.parse::<usize>().ok())
+    else {
+      continue;
+    };
+
+    next = next.max(number + 1);
+  }
+
+  Ok(next)
+}
+
+type Segment = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
+
+fn open_segment(
+  dir: &std::path::Path,
+  index: usize,
+) -> Result<(std::path::PathBuf, Segment)> {
+  let path = dir.join(format!("audio-{index:04}.wav"));
+  let spec = hound::WavSpec {
+    channels: 1,
+    sample_rate: SAMPLE_RATE,
+    bits_per_sample: 16,
+    sample_format: hound::SampleFormat::Int,
+  };
+
+  let writer = hound::WavWriter::create(&path, spec)
+    .with_context(|| format!("creating {}", path.display()))?;
+
+  Ok((path, writer))
+}
+
+/// Peak wake word score for each of some wav files.
+///
+/// The counterpart to `record`: point it at recordings of yourself
+/// saying the word and every one should fire, then point it at an
+/// evening of television and none of them should. What separates those
+/// two numbers is what `threshold` should sit in the middle of.
+async fn score(config: Config, paths: &[String]) -> Result<()> {
+  if paths.is_empty() {
+    bail!("usage: voice-control score <file.wav>...");
+  }
+
+  let file = CommandFile::load(&config.resolved_config_path())?;
+  let mut detector = wake_detector(&file)?;
+
+  let mut fired = 0_usize;
+
+  for path in paths {
+    let mut audio = read_wav(path)?;
+
+    // A file that stops on the last syllable never lets the word reach
+    // the middle of the model's two-second window, which is where it
+    // scores highest. A microphone would have gone on recording the
+    // room; make up the difference.
+    audio.resize(audio.len() + ms_to_samples(REPLAY_TRAILING_MS), 0.0);
+
+    // Each file starts from cold, the same as the daemon does after a
+    // command.
+    detector.reset();
+
+    let mut peak = 0.0_f32;
+    let mut peak_at = 0_usize;
+    let mut hit = None;
+    // The longest unbroken run of hops over the threshold, which is
+    // what `patience` is measured against: if the word holds the score
+    // up for longer than the things that merely glance off it, there
+    // is a patience that tells them apart.
+    let mut run = 0_usize;
+    let mut longest = 0_usize;
+
+    for (index, frame) in audio.chunks_exact(CHUNK).enumerate() {
+      let (score, detected) = detector.advance(frame)?;
+
+      if score > peak {
+        peak = score;
+        peak_at = index;
+      }
+
+      if score > file.wake.threshold {
+        run += 1;
+        longest = longest.max(run);
+      } else {
+        run = 0;
+      }
+
+      if detected && hit.is_none() {
+        hit = Some(index);
+      }
+    }
+
+    // Hops are reported by the audio that ends them, which is where
+    // the daemon would have reacted.
+    let at = |index: usize| (index + 1) * CHUNK;
+
+    let fired_at = match hit {
+      Some(index) => {
+        fired += 1;
+        format!("  FIRED at {:.1}s", at(index) as f32 / SAMPLE_RATE as f32)
+      }
+      None => String::new(),
+    };
+
+    println!(
+      "{path}  peak {peak:.3} at {:.1}s  run {longest}{fired_at}",
+      at(peak_at) as f32 / SAMPLE_RATE as f32,
+    );
+  }
+
+  println!(
+    "\n{fired}/{} fired at threshold {:.2}, patience {}",
+    paths.len(),
+    file.wake.threshold,
+    file.wake.patience
+  );
+
+  Ok(())
+}
+
 /// STT + matcher against a wav file, so phrase lists can be checked
 /// without touching the microphone.
 async fn transcribe(config: Config, path: Option<&String>) -> Result<()> {
@@ -426,12 +676,7 @@ async fn replay(config: Config, path: Option<&String>) -> Result<()> {
 
   let file = CommandFile::load(&config.resolved_config_path())?;
 
-  let detector = RustpotterDetector::load(
-    &file.wake.model,
-    file.wake.threshold,
-    file.wake.avg_threshold,
-    file.wake.eager,
-  )?;
+  let detector = wake_detector(&file)?;
   let transcriber =
     WhisperTranscriber::load(&file.stt.model, &file.vocabulary())?;
 

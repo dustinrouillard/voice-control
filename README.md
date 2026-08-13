@@ -41,7 +41,7 @@ un-mute.
 cpal capture ──► resample 48k→16k mono ──► 3s pre-roll ring
                           │
                     ┌─────┴─────┐
-                    │  IDLE     │  rustpotter scores every frame
+                    │  IDLE     │  openWakeWord scores every 80ms hop
                     └─────┬─────┘
                     "computa" ✔ → chirp
                           │
@@ -63,11 +63,11 @@ run continuously and whisper is not.
 
 The pre-roll is the part that is easy to get wrong. "computa, mute" is
 one breath, so the command is already partly spoken when the wake word
-starts scoring — and rustpotter then needs several more frames before
-it commits. Between them the whole utterance can be in the past by the
-time the detector says anything, so the window reaches back far enough
-to recover the wake word too. That the wake word ends up in the clip is
-fine: the matcher works over suffixes and drops it.
+starts scoring — and the detector then needs `patience` more hops
+before it commits. Between them the whole utterance can be in the past
+by the time the detector says anything, so the window reaches back far
+enough to recover the wake word too. That the wake word ends up in the
+clip is fine: the matcher works over suffixes and drops it.
 
 It also means the capture starts out having *already heard speech* —
 the wake word — whatever the user does next. Ending it on trailing
@@ -92,8 +92,33 @@ silence_ms = 700    # trailing silence that ends one already started
 max_ms = 8000       # ceiling on a capture, pre-roll included
 ```
 
-Both stages sit behind traits (`wake::Detector`, `stt::Transcriber`), so
-swapping in [openWakeWord][oww] later touches only `src/wake/`.
+Both stages sit behind traits (`wake::Detector`, `stt::Transcriber`),
+and the wake word is [openWakeWord][oww] through that trait, so the
+engine is one file: `src/wake/oww.rs`.
+
+It is three ONNX graphs in series, scored once per 80 ms hop:
+
+```
+1280 samples ─► melspectrogram ─► 8 mel frames of 32 bins
+                                     │  (ring of 80)
+                       last 76 frames ▼
+                                  embedding ─► 96 floats
+                                     │  (ring of 16)
+                                     ▼
+                                   wake ─► one probability
+```
+
+The first two are openWakeWord's own pretrained feature extractors and
+are the same whatever the wake word is; only the third is trained per
+word. That split is the whole reason this replaced rustpotter, which
+matched a waveform against a dozen recordings of it and could not tell
+the wake word from a television. The embedding model is a speech
+representation trained on a very large corpus, so the classifier is
+asked "what was said", not "how close is this to my takes" — a working
+model reads ~0.00 on speech that is not its word rather than 0.6.
+
+Inference runs on ONNX Runtime via `ort`, which was already in the tree:
+the Silero VAD uses it too.
 
 [oww]: https://github.com/dscripka/openWakeWord
 
@@ -116,59 +141,40 @@ commands and still runs in well under 200 ms on Apple Silicon. Drop to
 
 ### 2. Wake word model
 
-Nothing ships a "computa" model, so train one. Record on **the mic you
-actually use** — the model does not transfer well between microphones.
+Three files: the two shared feature extractors, which never change, and
+a classifier for the word itself.
 
 ```bash
-# --locked is required: rustpotter pulls an old candle-core that only
-# builds against the versions in its own published lockfile.
-cargo install rustpotter-cli --locked
-
-mkdir -p samples
-for i in $(seq 1 12); do
-  rustpotter-cli record "samples/computa-$i.wav"   # say "computa", ctrl-c
-done
-
-# Crop each take to the word itself. Do not skip this.
-python3 scripts/trim-samples.py samples samples-trimmed
-
-rustpotter-cli build \
-  --name computa \
-  --path ~/.config/voice-control/computa.rpw \
-  samples-trimmed/*.wav
+cd ~/.config/voice-control
+base=https://github.com/dscripka/openWakeWord/releases/download/v0.5.1
+curl -L -O $base/melspectrogram.onnx
+curl -L -O $base/embedding_model.onnx
+curl -L -O $base/alexa_v0.1.onnx && mv alexa_v0.1.onnx alexa.onnx
 ```
 
-`build` makes a reference model from a handful of recordings, which is
-what you want here. (`train` builds a neural model and wants a corpus.)
+`alexa`, `hey_jarvis`, `hey_mycroft` and `hey_rhasspy` are the
+pretrained words, and they are very good: `alexa_v0.1` reads 1.000 on
+"alexa" and below 0.07 on everything else tried here, including real
+speech, "computer", and a directory of takes of a different wake word.
+Point `[wake] model` at whichever one you want.
 
-**Trimming is not optional.** `record` runs until you hit ctrl-c, so a
-take is two or three seconds of room tone with half a second of speech
-somewhere inside it — and rustpotter builds its template from the whole
-file. Untrimmed takes compare mostly-silence against mostly-silence at
-different offsets and score near zero; a model built from raw takes
-failed to detect *its own training samples*. After trimming, the same
-takes detect 11/11 at the default threshold. Aim for templates of
-roughly 600–800 ms, which is what the script produces.
-
-A take that is all silence — ctrl-c pressed too early — makes
-`rustpotter-cli build` panic with `index out of bounds: the len is 0`
-rather than naming the file. `trim-samples.py` reports and skips those;
-otherwise check for a suspiciously small wav.
-
-Vary the delivery across takes: normal, quiet, fast, and mid-sentence.
-Ten to fifteen is plenty. `say -v Samantha -r 180 computa` and friends
-make useful extra samples, but recordings of your own voice on your own
-mic do most of the work.
-
-Sanity-check the model before moving on — every take should detect:
+**Any other word has to be trained**, which openWakeWord does with a
+corpus of synthetic speech, not a handful of takes — see [its training
+notebooks][train]. A model trained on too few negatives is worse than
+useless here: one tried during this port fired at 0.98+ on ordinary
+dialogue that sounded nothing like its word, which is exactly the
+failure that made rustpotter unusable. Check any model you are given
+before trusting it:
 
 ```bash
-for f in samples/*.wav; do
-  echo -n "$f "
-  rustpotter-cli test ~/.config/voice-control/computa.rpw "$f" \
-    | grep -oE 'score: [0-9.]+' | tail -1
-done
+# Should all fire.
+cargo run --release -- score positives/*.wav
+# Should all read ~0.00. If they do not, the model is not usable,
+# whatever it scores on the word itself.
+cargo run --release -- score negatives/*.wav
 ```
+
+[train]: https://github.com/dscripka/openWakeWord#training-new-models
 
 ### 3. Commands
 
@@ -190,24 +196,46 @@ Prints an input level once a second and a line per detection:
 
 ```
   level 0.067  ###
-  1  computa  score 0.612
+  1  alexa  score 0.998
 ```
 
 If the level stays at zero, the microphone permission is the problem,
 not the model — it says so after five seconds of silence.
 
-Say the wake word twenty times and count the hits, then leave it
-running through a normal conversation and count the false ones. Raise
-`threshold` / `avg_threshold` if it fires while you are just talking;
-lower them if it misses you.
+With a well-trained model there is not much to tune: scores sit at
+either end of the range, so anything from 0.3 to 0.8 behaves the same
+and 0.5 is fine. Tuning only starts to matter when the model is
+marginal, and then the honest answer is usually a better model.
 
-`eager = true` (the default) makes rustpotter commit as soon as enough
-partial scores agree instead of waiting for the score to peak. That
-costs a little accuracy and saves a few hundred milliseconds, which is
-the better trade here because whisper re-checks the result anyway. It
-also keeps the captured clip tight — with `eager = false` the detection
-can land so late that the command has already scrolled out of the
-pre-roll window.
+Guessing at it from a live microphone is slow, so there are two
+subcommands for doing it from recordings instead. `record` writes the
+microphone to a directory of one-minute wavs and prints every hit as it
+happens, with the file and offset:
+
+```bash
+cargo run --release -- record ~/negatives     # leave it running
+  1  audio-0003.wav    12.4s  score 0.981     # ← go and listen to that
+```
+
+Leave it going through whatever sets the daemon off. Then `score`
+replays wavs through the detector — no microphone, no whisper, nothing
+dispatched — and prints the peak score, the longest run of hops over
+the threshold, and whether it would have fired:
+
+```bash
+cargo run --release -- score ~/negatives/*.wav
+audio-0003.wav  peak 0.981 at 12.4s  run 6  FIRED at 12.2s
+```
+
+`threshold` wants to sit in the gap between what your voice scores and
+what the room scores. If there is no gap — if `run` is as long on
+television as it is on you — no threshold will fix it.
+
+`patience` is the other lever: how many consecutive 80 ms hops have to
+clear the threshold before it counts. It costs `patience` × 80 ms of
+latency, which the pre-roll absorbs, and it drops false positives that
+only glance off the model for a frame or two. Two is a good default;
+raising it trades a little responsiveness for fewer of them.
 
 ### 5. Install
 
@@ -733,6 +761,7 @@ grep "no matching command" ~/Library/Application\ Support/voice-control/logs/std
   not while they are the ones saying it.
 - Commands are a literal phrase → a fixed action. No parameters ("set
   volume to 30") without extending the matcher.
-- `half` is pinned to `=2.4.1` in `Cargo.toml`. It is not used directly;
-  rustpotter pulls candle-core 0.2.2, which calls the rand 0.8 API, and
-  half ≥ 2.5 moved its impls to rand 0.9.
+- `ort` is pinned to `=2.0.0-rc.10` in `Cargo.toml`, which is the
+  version `voice_activity_detector` asks for. The wake word and the VAD
+  both run on ONNX Runtime, and two `ort` versions in one binary means
+  two copies of the runtime.

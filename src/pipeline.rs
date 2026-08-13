@@ -20,12 +20,12 @@ use crate::wake::Detector;
 ///
 /// Two effects stack here. "computa, mute" is one breath, so the
 /// command is already partly spoken when the wake word starts
-/// scoring - and rustpotter then needs several more frames before it
-/// will commit to a detection. Between them the whole utterance can
-/// be in the past by the time we are told about it, so the window
-/// reaches back far enough to recover the wake word itself. That the
-/// wake word lands in the clip is fine: the matcher works over
-/// suffixes and drops it.
+/// scoring - and the detector then needs `patience` more hops before
+/// it will commit. Between them the whole utterance can be in the
+/// past by the time we are told about it, so the window reaches back
+/// far enough to recover the wake word itself. That the wake word
+/// lands in the clip is fine: the matcher works over suffixes and
+/// drops it.
 const PRE_ROLL_MS: usize = 900;
 /// Ring capacity. Comfortably more than PRE_ROLL_MS.
 const RING_MS: usize = 3000;
