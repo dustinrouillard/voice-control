@@ -7,7 +7,9 @@ use serde::Deserialize;
 use strsim::jaro_winkler;
 
 use crate::audio::vad::Timing;
+use crate::config::expand_tilde;
 use crate::devices::Direction;
+use crate::exec::{self, Program};
 use crate::media::MediaKey;
 use crate::obs::{ObsConfig, SourceAction, Visibility};
 use tracing::warn;
@@ -149,6 +151,22 @@ pub struct Step {
   /// is default", so it stays where it is until a restart.
   #[serde(default)]
   pub input: Option<String>,
+  /// A program to run: a path, `~` and all, or a bare name to find on
+  /// PATH. For the things that ship a CLI and no API.
+  #[serde(default)]
+  pub run: Option<String>,
+  /// Arguments for `run`, handed over as written - there is no shell
+  /// here to split or expand them, so one entry is one argument
+  /// however many spaces are in it.
+  #[serde(default)]
+  pub args: Vec<String>,
+  /// Environment for `run`, on top of the daemon's own.
+  #[serde(default)]
+  pub env: HashMap<String, String>,
+  /// How long `run` may take before it is killed. Ignored without
+  /// one.
+  #[serde(default)]
+  pub timeout_ms: Option<u64>,
 }
 
 impl Default for Step {
@@ -167,6 +185,10 @@ impl Default for Step {
       output: None,
       sound: None,
       input: None,
+      run: None,
+      args: Vec::new(),
+      env: HashMap::new(),
+      timeout_ms: None,
     }
   }
 }
@@ -174,6 +196,11 @@ impl Default for Step {
 /// Long enough for the move animations these are written against, and
 /// what the equivalent Companion button waits.
 const DEFAULT_HIDE_DELAY: Duration = Duration::from_millis(350);
+
+/// Long enough for a CLI that has to wake something up and connect to
+/// it, short enough that a command which is never coming back stops
+/// holding the pipeline open. `timeout_ms` overrides it per step.
+const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What one step actually does.
 pub enum Action<'a> {
@@ -193,13 +220,15 @@ pub enum Action<'a> {
   /// Play a wav from the sounds directory, named without the
   /// extension.
   Sound(&'a str),
+  /// Run a local program and wait for it.
+  Run(Program<'a>),
   Wait(Duration),
 }
 
 /// The fields a step can name an action with, for the errors about
 /// naming none of them or several.
 const ACTION_FIELDS: &str =
-  "url, scene, source, media, output, input, sound and wait_ms";
+  "url, scene, source, media, output, input, sound, run and wait_ms";
 
 impl Command {
   /// The steps to run, in order - the explicit list, or the one the
@@ -260,6 +289,17 @@ impl Step {
       return Action::Sound(name);
     }
 
+    if let Some(bin) = &self.run {
+      return Action::Run(Program {
+        bin,
+        args: &self.args,
+        env: &self.env,
+        timeout: self
+          .timeout_ms
+          .map_or(DEFAULT_RUN_TIMEOUT, Duration::from_millis),
+      });
+    }
+
     match (&self.url, &self.source, &self.scene, self.wait_ms) {
       (Some(url), None, None, None) => Action::Http {
         method: &self.method,
@@ -295,6 +335,10 @@ impl Step {
       && self.output.is_none()
       && self.input.is_none()
       && self.sound.is_none()
+      && self.run.is_none()
+      && self.args.is_empty()
+      && self.env.is_empty()
+      && self.timeout_ms.is_none()
       && self.visible.is_none()
       && self.show_filter.is_none()
       && self.hide_filter.is_none()
@@ -302,8 +346,23 @@ impl Step {
   }
 
   /// Checks the step names exactly one thing to do, and that the
-  /// source-only fields have a source to act on.
+  /// fields belonging to one action have that action to act on.
   fn validate(&self) -> Result<()> {
+    if self.run.is_none() {
+      let stray = [
+        (!self.args.is_empty()).then_some("args"),
+        (!self.env.is_empty()).then_some("env"),
+        self.timeout_ms.is_some().then_some("timeout_ms"),
+      ]
+      .into_iter()
+      .flatten()
+      .next();
+
+      if let Some(field) = stray {
+        bail!("sets {field} without a run");
+      }
+    }
+
     if self.source.is_none() {
       let stray = [
         self.visible.is_some().then_some("visible"),
@@ -343,6 +402,7 @@ impl Step {
       self.output.is_some(),
       self.input.is_some(),
       self.sound.is_some(),
+      self.run.is_some(),
     ]
     .into_iter()
     .filter(|set| *set)
@@ -393,6 +453,39 @@ impl Step {
     Ok(())
   }
 
+  /// Expands `~` in `run`, and says at startup when the program is not
+  /// where the config says it is.
+  ///
+  /// A warning rather than an error: unlike a device alias, the path
+  /// itself is the whole name, and a binary that is missing today
+  /// might be one that is only not installed yet - which is no reason
+  /// for every other command in the file to stop working. The warning
+  /// is there because the alternative is finding out by saying the
+  /// words and getting the failure tone.
+  fn resolve_program(&mut self) -> Result<()> {
+    let Some(bin) = &mut self.run else {
+      return Ok(());
+    };
+
+    if bin.trim().is_empty() {
+      bail!("has an empty run");
+    }
+
+    // launchd does not run a shell, so nothing else would expand it.
+    *bin = expand_tilde(bin).to_string_lossy().into_owned();
+
+    if exec::locate(bin).is_none() {
+      warn!(
+        program = %bin,
+        "no such program - launchd gives an agent a PATH of \
+         /usr/bin:/bin:/usr/sbin:/sbin and nothing else, so name it in \
+         full if it lives anywhere else"
+      );
+    }
+
+    Ok(())
+  }
+
   fn expand_targets(
     &mut self,
     targets: &HashMap<String, String>,
@@ -432,6 +525,15 @@ impl Step {
       }
       Action::Sound(name) => format!("play {name}.wav"),
       Action::Wait(delay) => format!("wait {}ms", delay.as_millis()),
+      Action::Run(program) => {
+        // Arguments included: two commands that run the same binary
+        // are told apart by nothing else.
+        if program.args.is_empty() {
+          format!("run {}", program.bin)
+        } else {
+          format!("run {} {}", program.bin, program.args.join(" "))
+        }
+      }
       Action::Source(action) => {
         let mut target = match action.scene {
           Some(scene) => format!(
@@ -569,6 +671,7 @@ impl CommandFile {
           .validate()
           .and_then(|()| step.expand_targets(&self.targets))
           .and_then(|()| step.resolve_devices(&self.devices))
+          .and_then(|()| step.resolve_program())
           .with_context(|| {
             format!("command {name:?}, step {}", index + 1)
           })?;
@@ -924,6 +1027,107 @@ mod tests {
       file.commands[1].target(),
       "input device \"Wireless microphone\""
     );
+  }
+
+  #[test]
+  fn a_run_step_carries_its_arguments() {
+    let raw = r#"
+      [[commands]]
+      name = "lights"
+      phrases = ["lights"]
+      run = "/bin/echo"
+      args = ["toggle", "desk lamp"]
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let Action::Run(program) = file.commands[0].steps()[0].action() else {
+      panic!("not a run action");
+    };
+
+    assert_eq!(program.bin, "/bin/echo");
+    assert_eq!(program.args, ["toggle", "desk lamp"]);
+    assert_eq!(program.timeout, DEFAULT_RUN_TIMEOUT);
+    assert_eq!(
+      file.commands[0].target(),
+      "run /bin/echo toggle desk lamp"
+    );
+  }
+
+  #[test]
+  fn a_run_step_takes_a_timeout_and_an_environment() {
+    let raw = r#"
+      [[commands]]
+      name = "lights"
+      phrases = ["lights"]
+      run = "/bin/echo"
+      timeout_ms = 2500
+      env = { LIGHTS_HOST = "10.0.0.4" }
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let Action::Run(program) = file.commands[0].steps()[0].action() else {
+      panic!("not a run action");
+    };
+
+    assert_eq!(program.timeout, Duration::from_millis(2500));
+    assert_eq!(program.env["LIGHTS_HOST"], "10.0.0.4");
+  }
+
+  /// launchd does not run a shell, so a `~` that nothing expanded
+  /// would be looked for as a directory literally called "~".
+  #[test]
+  fn a_run_step_expands_a_tilde() {
+    let raw = r#"
+      [[commands]]
+      name = "lights"
+      phrases = ["lights"]
+      run = "~/bin/lights"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let bin = file.commands[0].steps()[0].run.as_deref().unwrap();
+
+    assert!(!bin.starts_with('~'), "{bin}");
+    assert!(bin.ends_with("/bin/lights"), "{bin}");
+  }
+
+  /// Silently ignoring them would leave a config that does not do what
+  /// it plainly reads as - the arguments would simply never arrive.
+  #[test]
+  fn rejects_args_without_a_run() {
+    let raw = r#"
+      [[commands]]
+      name = "confused"
+      phrases = ["x"]
+      url = "http://example/x"
+      args = ["toggle"]
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("args"), "{why}");
+  }
+
+  #[test]
+  fn rejects_a_step_that_sets_both_run_and_url() {
+    let raw = r#"
+      [[commands]]
+      name = "confused"
+      phrases = ["x"]
+      run = "/bin/echo"
+      url = "http://example/x"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+
+    assert!(file.resolve().is_err());
   }
 
   /// A command that makes its own noise is the one kind that should

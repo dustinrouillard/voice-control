@@ -26,6 +26,7 @@ pub mod commands;
 pub mod config;
 pub mod devices;
 pub mod dispatch;
+pub mod exec;
 pub mod feedback;
 pub mod media;
 pub mod obs;

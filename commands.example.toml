@@ -203,6 +203,42 @@ name = "wireless mic"
 phrases = ["wireless mic", "wireless microphone", "use the wireless mic"]
 input = "microphone"
 
+# `run` executes a local program - the binary, plus `args` handed to it
+# as written. This is for anything that ships a CLI and no API, which
+# is otherwise out of reach of a daemon that only speaks HTTP and
+# obs-websocket.
+#
+# There is no shell in between. One entry in `args` is one argument
+# however many spaces are in it, and there is nothing to quote, glob or
+# expand - and nothing a misheard phrase can reach either, since the
+# arguments come from this file and never from the transcript.
+#
+# Name the binary in full. launchd starts an agent with a PATH of
+# /usr/bin:/bin:/usr/sbin:/sbin and nothing else, so a bare name that
+# works in your shell - anything under /opt/homebrew/bin, say - is not
+# on the daemon's PATH. A leading ~ is expanded here, since no shell is
+# running to do it. A program that is not where this says is a warning
+# at startup rather than a load error: it may only be one that is not
+# installed yet, which is no reason for every other command to stop.
+#
+# The step fails if the program exits non-zero - that is the only thing
+# it tells us - which stops the flow and plays the failure tone.
+# Whatever it printed goes to the log either way.
+#
+# timeout_ms is when it gets killed, and defaults to 10000. Something
+# that never comes back would otherwise hold the pipeline open, which
+# is the wake word not answering you until it does.
+#
+# env adds to the environment the daemon itself was started with.
+
+[[commands]]
+name = "desk lights"
+phrases = ["lights", "desk lights", "toggle the lights"]
+run = "~/bin/lights"
+args = ["toggle"]
+# timeout_ms = 5000
+# env = { LIGHTS_HOST = "10.0.0.4" }
+
 # OBS scenes. Each scene you want to reach needs its own entry - the
 # daemon can only switch to scenes named here, never to whatever it
 # thinks it heard. `scene` must match the OBS name exactly; run

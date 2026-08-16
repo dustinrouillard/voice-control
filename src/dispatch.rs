@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use crate::commands::{Action, Command, Step};
 use crate::devices;
+use crate::exec;
 use crate::feedback::Feedback;
 use crate::media;
 use crate::obs::{self, ObsConfig};
@@ -94,6 +95,24 @@ impl Dispatcher {
           device = switch.name,
           changed = switch.changed,
           "set the default audio device"
+        );
+
+        Ok(())
+      }
+      // The only step that hands control to something we did not
+      // write, so it is also the only one with a timeout of its own.
+      Action::Run(program) => {
+        let bin = program.bin;
+
+        let output = exec::run(program)
+          .await
+          .with_context(|| format!("running {bin}"))?;
+
+        info!(
+          command = %command.name,
+          program = bin,
+          output = %output,
+          "ran"
         );
 
         Ok(())

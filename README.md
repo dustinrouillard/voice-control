@@ -2,7 +2,7 @@
 
 A background macOS agent that listens for **"computa, …"** and turns the
 command that follows into an HTTP request, an OBS change, a media key,
-or an audio device switch.
+an audio device switch, or a local program.
 
 ```
 computa, mute            ->  POST :8009/v1/voice/canary/mute/on
@@ -566,6 +566,52 @@ That is not only cosmetic: writing the property fires the HAL
 notification it was set from, and there is another agent on this
 machine listening for that one.
 
+### Programs
+
+`run` executes a local program. Everything else a command can do
+reaches something over a socket — HTTP, obs-websocket, the HAL — which
+leaves anything that ships a CLI and no API out of reach:
+
+```toml
+[[commands]]
+name = "desk lights"
+phrases = ["lights", "desk lights", "toggle the lights"]
+run = "~/bin/lights"
+args = ["toggle"]
+timeout_ms = 5000                    # default 10000
+env = { LIGHTS_HOST = "10.0.0.4" }   # on top of the daemon's own
+```
+
+**There is no shell in between.** The program is executed directly, so
+one entry in `args` is one argument however many spaces are in it, and
+there is nothing to quote, glob or expand. Nothing a misheard phrase
+says can reach the arguments either: they come from the config file and
+never from the transcript.
+
+**Name the binary in full.** launchd starts an agent with a PATH of
+`/usr/bin:/bin:/usr/sbin:/sbin` and nothing else, so a bare name that
+works in your shell — anything under `/opt/homebrew/bin`, say — is not
+on the daemon's PATH at all. A leading `~` is expanded here since no
+shell is running to do it. A program that is not where the config says
+is a warning at startup rather than a load error: it may only be one
+that is not installed yet, which is no reason for every other command
+in the file to stop working.
+
+A non-zero exit fails the step — it is the only thing the program tells
+us, and chirping success over a program that just failed is worse than
+having no command at all. That stops the flow and plays the failure
+tone, with whatever it printed in the message. Output goes to the log
+on a successful run too, clipped to one line.
+
+`timeout_ms` is when it gets killed. The dispatch holds the pipeline
+open while the program runs, so something that never comes back is the
+wake word not answering you until it does — and the things worth saying
+this out loud to (bluetooth, a sleeping device, a network hop) are
+exactly the ones that can hang.
+
+`voice-control run "computa lights"` is the way to check one without
+saying anything, and prints the program and arguments it matched.
+
 ### Flows
 
 A command that does more than one thing is a list of steps, run in
@@ -603,9 +649,9 @@ rather than pressing on: if the scene switch did not happen there is no
 point enabling the move that was meant to play on it, and continuing
 would leave the source shown somewhere you cannot see it.
 
-Steps are not limited to OBS — HTTP and media keys are steps like any
-other, so one phrase can pause the music, mute Discord, switch scene
-and bring a source in:
+Steps are not limited to OBS — HTTP, media keys and programs are steps
+like any other, so one phrase can pause the music, mute Discord, switch
+scene and bring a source in:
 
 ```toml
 [[commands]]
