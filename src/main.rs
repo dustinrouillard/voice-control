@@ -31,6 +31,7 @@ pub mod feedback;
 pub mod media;
 pub mod obs;
 pub mod pipeline;
+pub mod publish;
 pub mod status;
 pub mod stt;
 pub mod tray;
@@ -147,6 +148,16 @@ fn run(config: Config) -> Result<()> {
   let detector = wake_detector(&file)?;
   let transcriber =
     WhisperTranscriber::load(&file.stt.model, &file.vocabulary())?;
+
+  // Before the detector is boxed away behind the trait, which does not
+  // know what the wake word is called.
+  if !file.status.url.is_empty() {
+    publish::spawn(
+      Arc::clone(&status),
+      file.status.url.clone(),
+      detector.name().to_string(),
+    );
+  }
 
   let (capture, audio) = capture::start(&config.input_device)?;
   status.set_device(&capture.device);

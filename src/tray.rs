@@ -576,6 +576,7 @@ mod tests {
       device: "MV7".into(),
       last_wake: None,
       history: Vec::new(),
+      utterances: 0,
     };
 
     assert_eq!(

@@ -27,6 +27,9 @@ pub struct CommandFile {
   pub wake: WakeConfig,
   #[serde(default)]
   pub stt: SttConfig,
+  /// Where to publish what the daemon is doing.
+  #[serde(default)]
+  pub status: StatusConfig,
   /// How long a capture runs for.
   #[serde(default)]
   pub listen: Timing,
@@ -66,6 +69,16 @@ pub struct WakeConfig {
 pub struct SttConfig {
   #[serde(default = "default_stt_model")]
   pub model: String,
+}
+
+/// Where to post state changes - the wake word landing, a command
+/// being dispatched, the microphone going quiet. Empty publishes
+/// nothing, which is the default: this exists for the OBS overlay and
+/// costs a running HTTP endpoint to use.
+#[derive(Debug, Default, Deserialize)]
+pub struct StatusConfig {
+  #[serde(default)]
+  pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -118,6 +118,12 @@ impl OpenWakeWordDetector {
     })
   }
 
+  /// What the model is called, taken from its filename. Reported with
+  /// every detection, and what the overlay labels itself with.
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+
   /// Scores one hop and reports both the probability and whether it
   /// completed a detection.
   ///

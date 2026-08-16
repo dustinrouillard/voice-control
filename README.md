@@ -772,6 +772,47 @@ to be dragged out (cmd-drag along the menu bar) once.
 over ssh or under a debugger, where there is no window server to talk
 to. Every subcommand is headless regardless.
 
+### Status feed
+
+Setting a URL under `[status]` makes the daemon post what it is doing
+to it. This exists for the OBS overlay, which lights an indicator when
+the wake word lands and shows what became of the command:
+
+```toml
+[status]
+url = "http://127.0.0.1:8080/api/voice"
+```
+
+```json
+{
+  "wake_word": "alexa",
+  "state": "idle",
+  "device": "Wireless microphone",
+  "result": {
+    "id": 42,
+    "transcript": "next track",
+    "outcome": "dispatched",
+    "command": "next track"
+  }
+}
+```
+
+`state` is one of `starting`, `idle`, `listening`, `thinking`,
+`paused`, `deaf`, `stalled`, `stopped` — the same picture the menu bar
+draws, including the two fault states, which carry `fault_ms`. `result`
+is present only while the last utterance is recent, and its `outcome`
+is `dispatched`, `failed`, `no_match` or `unheard`. `id` counts
+utterances from startup, so that saying the same thing twice is
+distinguishable from one command being reported twice.
+
+A post goes out when the picture changes and every five seconds
+regardless, which is what lets the far end tell a quiet daemon from a
+dead one. Nothing in the pipeline calls this — it watches the same
+`Status` the menu bar reads, which is also how the derived fault states
+get published without anything having to run a timer for them. An
+endpoint that is down is logged once and retried on the next change; it
+never blocks anything.
+
 ### Environment
 
 | Variable | Default | Meaning |

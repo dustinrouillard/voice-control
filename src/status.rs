@@ -88,6 +88,13 @@ pub struct Snapshot {
   pub device: String,
   pub last_wake: Option<Duration>,
   pub history: Vec<Entry>,
+  /// How many utterances have been finished since startup.
+  ///
+  /// The history alone cannot tell one from the next when they are
+  /// identical, and "next track" twice in a row is an ordinary thing
+  /// to say. Anything drawing an utterance needs to know it is looking
+  /// at a new one.
+  pub utterances: u64,
 }
 
 struct Inner {
@@ -104,6 +111,7 @@ struct Inner {
   last_wake: Option<Instant>,
   flash: Option<(bool, Instant)>,
   history: VecDeque<(Instant, String, Outcome)>,
+  utterances: u64,
 }
 
 /// Shared state between the pipeline and the menu bar.
@@ -130,6 +138,7 @@ impl Status {
         last_wake: None,
         flash: None,
         history: VecDeque::new(),
+        utterances: 0,
       }),
       paused: AtomicBool::new(false),
     }
@@ -191,6 +200,7 @@ impl Status {
 
     inner.phase = Phase::Idle;
     inner.flash = Some((outcome.ok(), now));
+    inner.utterances += 1;
     inner
       .history
       .push_front((now, transcript.to_string(), outcome));
@@ -219,6 +229,7 @@ impl Status {
           outcome: outcome.clone(),
         })
         .collect(),
+      utterances: inner.utterances,
     }
   }
 

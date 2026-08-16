@@ -23,6 +23,13 @@ patience = 2
 [stt]
 model = "~/.config/voice-control/ggml-base.en-q5_1.bin"
 
+# Post what the daemon is doing - the wake word landing, a command
+# being dispatched, the microphone going quiet - to an HTTP endpoint.
+# This is for the OBS overlay's voice indicator. Empty publishes
+# nothing, which is the default.
+[status]
+# url = "http://127.0.0.1:8080/api/voice"
+
 # How long a capture runs for, in milliseconds.
 [listen]
 # How long after the wake word the command may still be starting.
