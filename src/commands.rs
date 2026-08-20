@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::Value;
 use strsim::jaro_winkler;
 
 use crate::audio::vad::Timing;
 use crate::config::expand_tilde;
 use crate::devices::Direction;
 use crate::exec::{self, Program};
+use crate::hass::{self, HassConfig, ServiceCall};
 use crate::media::MediaKey;
 use crate::obs::{ObsConfig, SourceAction, Visibility};
 use tracing::warn;
@@ -41,6 +43,8 @@ pub struct CommandFile {
   pub devices: HashMap<String, String>,
   #[serde(default)]
   pub obs: ObsConfig,
+  #[serde(default)]
+  pub hass: HassConfig,
   #[serde(default)]
   pub commands: Vec<Command>,
 }
@@ -164,6 +168,25 @@ pub struct Step {
   /// is default", so it stays where it is until a restart.
   #[serde(default)]
   pub input: Option<String>,
+  /// A Home Assistant entity id to call a service on -
+  /// `switch.desk_speakers`. Which service is `service`, below.
+  ///
+  /// Entities are named one step at a time, the way scenes are: the
+  /// daemon can only reach the ones you put here.
+  #[serde(default)]
+  pub hass: Option<String>,
+  /// The service for `hass`, defaulting to `toggle`. Bare, and taken
+  /// as belonging to the entity's own domain - `turn_on` on a
+  /// `switch.` entity is `switch.turn_on` - or with a domain of its
+  /// own for the services that are not tied to one, such as
+  /// `homeassistant.turn_on`.
+  #[serde(default)]
+  pub service: Option<String>,
+  /// Anything else the service takes, sent alongside the entity:
+  /// `data = { brightness = 128 }`. Rarely needed for a switch, which
+  /// is either on or off.
+  #[serde(default)]
+  pub data: HashMap<String, Value>,
   /// A program to run: a path, `~` and all, or a bare name to find on
   /// PATH. For the things that ship a CLI and no API.
   #[serde(default)]
@@ -198,6 +221,9 @@ impl Default for Step {
       output: None,
       sound: None,
       input: None,
+      hass: None,
+      service: None,
+      data: HashMap::new(),
       run: None,
       args: Vec::new(),
       env: HashMap::new(),
@@ -233,6 +259,8 @@ pub enum Action<'a> {
   /// Play a wav from the sounds directory, named without the
   /// extension.
   Sound(&'a str),
+  /// Call a Home Assistant service on one entity.
+  Hass(ServiceCall<'a>),
   /// Run a local program and wait for it.
   Run(Program<'a>),
   Wait(Duration),
@@ -240,8 +268,8 @@ pub enum Action<'a> {
 
 /// The fields a step can name an action with, for the errors about
 /// naming none of them or several.
-const ACTION_FIELDS: &str =
-  "url, scene, source, media, output, input, sound, run and wait_ms";
+const ACTION_FIELDS: &str = "url, scene, source, media, output, input, sound, hass, run and \
+   wait_ms";
 
 impl Command {
   /// The steps to run, in order - the explicit list, or the one the
@@ -302,6 +330,14 @@ impl Step {
       return Action::Sound(name);
     }
 
+    if let Some(entity) = &self.hass {
+      return Action::Hass(ServiceCall {
+        entity,
+        service: self.service.as_deref().unwrap_or(hass::DEFAULT_SERVICE),
+        data: &self.data,
+      });
+    }
+
     if let Some(bin) = &self.run {
       return Action::Run(Program {
         bin,
@@ -348,6 +384,9 @@ impl Step {
       && self.output.is_none()
       && self.input.is_none()
       && self.sound.is_none()
+      && self.hass.is_none()
+      && self.service.is_none()
+      && self.data.is_empty()
       && self.run.is_none()
       && self.args.is_empty()
       && self.env.is_empty()
@@ -373,6 +412,20 @@ impl Step {
 
       if let Some(field) = stray {
         bail!("sets {field} without a run");
+      }
+    }
+
+    if self.hass.is_none() {
+      let stray = [
+        self.service.is_some().then_some("service"),
+        (!self.data.is_empty()).then_some("data"),
+      ]
+      .into_iter()
+      .flatten()
+      .next();
+
+      if let Some(field) = stray {
+        bail!("sets {field} without a hass entity");
       }
     }
 
@@ -415,6 +468,7 @@ impl Step {
       self.output.is_some(),
       self.input.is_some(),
       self.sound.is_some(),
+      self.hass.is_some(),
       self.run.is_some(),
     ]
     .into_iter()
@@ -461,6 +515,31 @@ impl Step {
       };
 
       *alias = pattern.clone();
+    }
+
+    Ok(())
+  }
+
+  /// Checks a `hass` step names an entity id, and that there is a
+  /// Home Assistant configured for it to be an entity of.
+  ///
+  /// At startup rather than at dispatch, for the same reason a device
+  /// alias is: Home Assistant answers a call naming an entity it does
+  /// not have with a 200 and no state change, so a config that is
+  /// wrong here looks exactly like one that works right up until you
+  /// say the words.
+  fn resolve_hass(&self, hass: &HassConfig) -> Result<()> {
+    let Some(entity) = &self.hass else {
+      return Ok(());
+    };
+
+    hass::validate_entity(entity)?;
+
+    if !hass.configured() {
+      bail!(
+        "names hass entity {entity:?}, but there is no [hass] table \
+         with a url to reach Home Assistant at"
+      );
     }
 
     Ok(())
@@ -537,6 +616,9 @@ impl Step {
         format!("{} device {pattern:?}", direction.as_str())
       }
       Action::Sound(name) => format!("play {name}.wav"),
+      Action::Hass(call) => {
+        format!("hass {} on {:?}", call.service(), call.entity)
+      }
       Action::Wait(delay) => format!("wait {}ms", delay.as_millis()),
       Action::Run(program) => {
         // Arguments included: two commands that run the same binary
@@ -684,6 +766,7 @@ impl CommandFile {
           .validate()
           .and_then(|()| step.expand_targets(&self.targets))
           .and_then(|()| step.resolve_devices(&self.devices))
+          .and_then(|()| step.resolve_hass(&self.hass))
           .and_then(|()| step.resolve_program())
           .with_context(|| {
             format!("command {name:?}, step {}", index + 1)
@@ -1040,6 +1123,166 @@ mod tests {
       file.commands[1].target(),
       "input device \"Wireless microphone\""
     );
+  }
+
+  /// A plug command is said the same way twice, so a step that names
+  /// nothing but the entity toggles it.
+  #[test]
+  fn a_hass_step_defaults_to_toggling() {
+    let raw = r#"
+      [hass]
+      url = "https://hass.lan"
+      token = "x"
+
+      [[commands]]
+      name = "speakers"
+      phrases = ["speakers"]
+      hass = "switch.desk_speakers"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let Action::Hass(call) = file.commands[0].steps()[0].action() else {
+      panic!("not a hass action");
+    };
+
+    assert_eq!(call.entity, "switch.desk_speakers");
+    assert_eq!(call.service(), "switch.toggle");
+    assert_eq!(
+      file.commands[0].target(),
+      "hass switch.toggle on \"switch.desk_speakers\""
+    );
+  }
+
+  #[test]
+  fn a_hass_step_carries_its_service_and_data() {
+    let raw = r#"
+      [hass]
+      url = "https://hass.lan"
+      token = "x"
+
+      [[commands]]
+      name = "desk lamp"
+      phrases = ["desk lamp"]
+      hass = "light.desk"
+      service = "turn_on"
+      data = { brightness = 128 }
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let Action::Hass(call) = file.commands[0].steps()[0].action() else {
+      panic!("not a hass action");
+    };
+
+    assert_eq!(call.service(), "light.turn_on");
+    assert_eq!(call.data["brightness"], 128);
+  }
+
+  /// The one thing a bare service cannot express: the services that
+  /// belong to no domain in particular.
+  #[test]
+  fn a_hass_service_can_name_its_own_domain() {
+    let raw = r#"
+      [hass]
+      url = "https://hass.lan"
+      token = "x"
+
+      [[commands]]
+      name = "speakers off"
+      phrases = ["speakers off"]
+      hass = "switch.desk_speakers"
+      service = "homeassistant.turn_off"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    let Action::Hass(call) = file.commands[0].steps()[0].action() else {
+      panic!("not a hass action");
+    };
+
+    assert_eq!(call.service(), "homeassistant.turn_off");
+  }
+
+  /// Home Assistant answers a call naming an entity it does not have
+  /// with a 200 and no state change, so nothing downstream of the load
+  /// would ever notice this.
+  #[test]
+  fn rejects_a_hass_entity_without_a_domain() {
+    let raw = r#"
+      [hass]
+      url = "https://hass.lan"
+      token = "x"
+
+      [[commands]]
+      name = "speakers"
+      phrases = ["speakers"]
+      hass = "desk_speakers"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("desk_speakers"), "{why}");
+    assert!(why.contains("switch.desk_speakers"), "{why}");
+  }
+
+  #[test]
+  fn rejects_a_hass_step_without_a_hass_table() {
+    let raw = r#"
+      [[commands]]
+      name = "speakers"
+      phrases = ["speakers"]
+      hass = "switch.desk_speakers"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("[hass] table"), "{why}");
+  }
+
+  /// Silently ignoring them would leave a config that does not do what
+  /// it plainly reads as - a `turn_on` that never reaches anything.
+  #[test]
+  fn rejects_a_service_without_a_hass_entity() {
+    let raw = r#"
+      [[commands]]
+      name = "confused"
+      phrases = ["x"]
+      url = "http://example/x"
+      service = "turn_on"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("service"), "{why}");
+  }
+
+  #[test]
+  fn rejects_a_step_that_sets_both_hass_and_output() {
+    let raw = r#"
+      [devices]
+      speakers = "CalDigit"
+
+      [hass]
+      url = "https://hass.lan"
+      token = "x"
+
+      [[commands]]
+      name = "confused"
+      phrases = ["x"]
+      hass = "switch.desk_speakers"
+      output = "speakers"
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+
+    assert!(file.resolve().is_err());
   }
 
   #[test]

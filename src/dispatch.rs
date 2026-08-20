@@ -7,6 +7,7 @@ use crate::commands::{Action, Command, Step};
 use crate::devices;
 use crate::exec;
 use crate::feedback::Feedback;
+use crate::hass::{Hass, HassConfig};
 use crate::media;
 use crate::obs::{self, ObsConfig};
 
@@ -17,11 +18,19 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 pub struct Dispatcher {
   client: reqwest::Client,
   obs: ObsConfig,
+  /// `None` when the config has no `[hass]` table, which is also when
+  /// nothing can reach a step that needs one - `resolve` rejects a
+  /// hass step without a Home Assistant to send it to.
+  hass: Option<Hass>,
   feedback: Feedback,
 }
 
 impl Dispatcher {
-  pub fn new(obs: ObsConfig, feedback: Feedback) -> Result<Self> {
+  pub fn new(
+    obs: ObsConfig,
+    hass: &HassConfig,
+    feedback: Feedback,
+  ) -> Result<Self> {
     let client = reqwest::Client::builder()
       .timeout(TIMEOUT)
       .build()
@@ -30,6 +39,11 @@ impl Dispatcher {
     Ok(Self {
       client,
       obs,
+      // A client of its own rather than the one above: the certificate
+      // exception `insecure` asks for belongs to the ingress in front
+      // of Home Assistant, and has no business weakening the calls to
+      // everything else.
+      hass: Hass::connect(hass)?,
       feedback,
     })
   }
@@ -124,6 +138,39 @@ impl Dispatcher {
           .with_context(|| format!("playing {name}.wav"))?;
 
         info!(command = %command.name, sound = name, "played");
+
+        Ok(())
+      }
+      Action::Hass(call) => {
+        let entity = call.entity;
+        let service = call.service();
+
+        // Unreachable through a loaded config, which rejects a hass
+        // step without a `[hass]` table - but the client is optional
+        // and the message should say what is missing either way.
+        let Some(hass) = &self.hass else {
+          bail!(
+            "calling {service} on {entity:?} needs a [hass] table with \
+             a url"
+          );
+        };
+
+        let changed = hass
+          .call(call)
+          .await
+          .with_context(|| format!("calling {service} on {entity:?}"))?;
+
+        info!(
+          command = %command.name,
+          entity,
+          service = %service,
+          // Zero means the call landed and changed nothing: a switch
+          // that was already off, or an entity id Home Assistant does
+          // not have. Both are a 200, and this is what tells them
+          // apart after the fact.
+          changed,
+          "called home assistant"
+        );
 
         Ok(())
       }

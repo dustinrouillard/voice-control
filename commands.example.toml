@@ -54,6 +54,21 @@ url = "ws://127.0.0.1:4455"
 # keeps the secret out of this file. If you do put it here, chmod 600.
 password = ""
 
+# Home Assistant, for the `hass` steps below. Leave the url empty and
+# there is no Home Assistant - a command naming an entity is then a
+# load error rather than something that fails when you say it.
+[hass]
+# url = "https://hass.lan"
+# A long-lived access token, from the bottom of your Home Assistant
+# profile page. Leave empty to read HASS_TOKEN from the environment
+# instead, which keeps the secret out of this file. If you do put it
+# here, chmod 600.
+token = ""
+# Accept the ingress certificate without checking it, for the private
+# CA a local ingress is usually fronted by. Nothing is then verifying
+# who answered, so leave it off for anything reached over the internet.
+# insecure = true
+
 # Base URLs, referenced as {name} below.
 [targets]
 # discord-rpc-control, running as a LaunchAgent on this machine.
@@ -209,6 +224,44 @@ output = "headphones"
 name = "wireless mic"
 phrases = ["wireless mic", "wireless microphone", "use the wireless mic"]
 input = "microphone"
+
+# `hass` calls a Home Assistant service on one entity, over the REST
+# API. Entities are named one command at a time, the way scenes are:
+# the daemon can only reach the ones written here.
+#
+# `service` defaults to `toggle` and is taken as belonging to the
+# entity's own domain, so `turn_on` on a `switch.` entity is
+# `switch.turn_on`. A service that names a domain of its own is used as
+# written, which is how the domain-agnostic ones - `homeassistant.turn_off`
+# and friends - are reached. `data` is anything else the service takes.
+#
+# `voice-control hass` lists the entities Home Assistant has, with the
+# ones commands here already use, and warns about any that it does not
+# have - a wrong entity id is otherwise silent, since Home Assistant
+# answers a call naming one with a perfectly happy 200 and no change.
+#
+# Switching outputs by plug rather than by device belongs here: make
+# the speakers command turn the plug on and the headphones command turn
+# it off, in place of the `output` steps above. Both at once is a flow -
+# plug on, then point the default output at it.
+
+# Commented out along with the url above, since a command naming an
+# entity with no Home Assistant configured to look it up in is a load
+# error - fill in [hass] and uncomment both.
+#
+# [[commands]]
+# name = "coffee"
+# phrases = ["coffee", "coffee machine", "make coffee"]
+# hass = "switch.coffee_machine"
+#
+# [[commands]]
+# name = "good night"
+# # `toggle` is meaningless on a scene, so this one says which way it
+# # goes. Same for a script.
+# phrases = ["good night", "goodnight", "night night"]
+# hass = "scene.good_night"
+# service = "turn_on"
+# # data = { transition = 5 }
 
 # `run` executes a local program - the binary, plus `args` handed to it
 # as written. This is for anything that ships a CLI and no API, which

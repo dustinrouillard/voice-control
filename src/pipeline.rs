@@ -11,7 +11,6 @@ use crate::audio::{ms_to_samples, samples_to_ms};
 use crate::commands::{Command, match_command};
 use crate::dispatch::{Dispatcher, try_run};
 use crate::feedback::{Cue, Feedback};
-use crate::obs::ObsConfig;
 use crate::status::{Outcome, Status};
 use crate::stt::Transcriber;
 use crate::wake::Detector;
@@ -61,7 +60,7 @@ impl Pipeline {
     transcriber: Box<dyn Transcriber>,
     commands: Vec<Command>,
     feedback: Feedback,
-    obs: ObsConfig,
+    dispatcher: Dispatcher,
     timing: &Timing,
     status: Arc<Status>,
   ) -> Result<Self> {
@@ -70,7 +69,7 @@ impl Pipeline {
       endpointer: Endpointer::new(timing)?,
       transcriber: Arc::new(Mutex::new(transcriber)),
       commands,
-      dispatcher: Dispatcher::new(obs, feedback.clone())?,
+      dispatcher,
       feedback,
       status,
       pre_roll: PreRoll::new(ms_to_samples(RING_MS)),

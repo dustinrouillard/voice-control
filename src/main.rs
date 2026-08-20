@@ -28,6 +28,7 @@ pub mod devices;
 pub mod dispatch;
 pub mod exec;
 pub mod feedback;
+pub mod hass;
 pub mod media;
 pub mod obs;
 pub mod pipeline;
@@ -57,6 +58,10 @@ usage: voice-control [command]
   transcribe <file>   transcribe a 16kHz mono wav and match it
   run <phrase>        match a phrase and dispatch it, as if you said it
   replay <file>       run a 16kHz mono wav through the whole pipeline
+  hass [filter]       list home assistant entities, with the ones
+                      commands use
+  hass <entity> [service]
+                      call a service on one entity - toggle by default
   obs [scene]         list obs scenes, or switch to one
   obs sources [scene] list the sources in a scene
   obs filters [scene] list the filters on a scene or source
@@ -102,6 +107,7 @@ fn main() -> Result<()> {
     Some("transcribe") => blocking(transcribe(config, args.get(1))),
     Some("run") => blocking(run_phrase(config, args.get(1))),
     Some("replay") => blocking(replay(config, args.get(1))),
+    Some("hass") => blocking(hass_cli(config, &args[1..])),
     Some("obs") => blocking(obs(config, &args[1..])),
     Some("media") => media_key(args.get(1)),
     Some("-h" | "--help" | "help") => {
@@ -162,12 +168,16 @@ fn run(config: Config) -> Result<()> {
   let (capture, audio) = capture::start(&config.input_device)?;
   status.set_device(&capture.device);
 
+  let feedback = Feedback::new(&config.sounds_dir);
+  let dispatcher =
+    Dispatcher::new(file.obs, &file.hass, feedback.clone())?;
+
   let pipeline = Pipeline::new(
     Box::new(detector) as Box<dyn Detector>,
     Box::new(transcriber) as Box<dyn Transcriber>,
     file.commands,
-    Feedback::new(&config.sounds_dir),
-    file.obs,
+    feedback,
+    dispatcher,
     &file.listen,
     Arc::clone(&status),
   )?;
@@ -692,12 +702,16 @@ async fn replay(config: Config, path: Option<&String>) -> Result<()> {
   let transcriber =
     WhisperTranscriber::load(&file.stt.model, &file.vocabulary())?;
 
+  let feedback = Feedback::new(&config.sounds_dir);
+  let dispatcher =
+    Dispatcher::new(file.obs, &file.hass, feedback.clone())?;
+
   let mut pipeline = Pipeline::new(
     Box::new(detector) as Box<dyn Detector>,
     Box::new(transcriber) as Box<dyn Transcriber>,
     file.commands,
-    Feedback::new(&config.sounds_dir),
-    file.obs,
+    feedback,
+    dispatcher,
     &file.listen,
     Arc::new(Status::new()),
   )?;
@@ -719,6 +733,138 @@ async fn replay(config: Config, path: Option<&String>) -> Result<()> {
   }
 
   pipeline.flush().await;
+
+  Ok(())
+}
+
+/// `hass`, in its two forms.
+///
+/// An entity id has a dot in it and a filter does not, which is what
+/// tells `hass switch.desk_speakers` from `hass speaker` - and a bare
+/// word is not a thing Home Assistant could be asked to act on
+/// anyway, so nothing is shadowed by reading it as a filter.
+async fn hass_cli(config: Config, args: &[String]) -> Result<()> {
+  let file = CommandFile::load(&config.resolved_config_path())?;
+
+  let Some(client) = hass::Hass::connect(&file.hass)? else {
+    bail!(
+      "no [hass] table with a url in {}",
+      config.resolved_config_path().display()
+    );
+  };
+
+  match args.first() {
+    Some(entity) if entity.contains('.') => {
+      hass_call(&client, entity, args.get(1)).await
+    }
+    filter => hass_entities(&client, &file, filter).await,
+  }
+}
+
+/// Calls a service without going through a command - the way to check
+/// an entity id and, on a network with its own CA, that the
+/// certificate is either trusted or `insecure`.
+async fn hass_call(
+  client: &hass::Hass,
+  entity: &str,
+  service: Option<&String>,
+) -> Result<()> {
+  hass::validate_entity(entity)?;
+
+  let data = std::collections::HashMap::new();
+  let call = hass::ServiceCall {
+    entity,
+    service: service.map_or(hass::DEFAULT_SERVICE, String::as_str),
+    data: &data,
+  };
+
+  let service = call.service();
+  let changed = client.call(call).await?;
+
+  println!("called {service} on {entity:?}");
+
+  // A call that changed nothing is a 200 like any other, and is either
+  // an entity already in that state or an id that does not exist.
+  if changed == 0 {
+    println!(
+      "  nothing changed - either it was already there, or there is no \
+       {entity:?}"
+    );
+  } else {
+    println!("  {changed} entity/entities changed");
+  }
+
+  Ok(())
+}
+
+/// The entities Home Assistant has, so `hass = "..."` entries can be
+/// copied out verbatim, with the current state of each and which ones
+/// commands already use - the same listing `obs sources` gives, and
+/// for the same reason.
+async fn hass_entities(
+  client: &hass::Hass,
+  file: &CommandFile,
+  filter: Option<&String>,
+) -> Result<()> {
+  let entities = client.states().await?;
+
+  let mut wired: Vec<&str> = file
+    .commands
+    .iter()
+    .flat_map(Command::steps)
+    .filter_map(|step| step.hass.as_deref())
+    .collect();
+
+  wired.sort_unstable();
+  wired.dedup();
+
+  let matches = |id: &str, name: &str| match filter {
+    Some(filter) => {
+      let filter = filter.to_lowercase();
+      id.to_lowercase().contains(&filter)
+        || name.to_lowercase().contains(&filter)
+    }
+    None => true,
+  };
+
+  let mut shown = 0;
+
+  for entity in &entities {
+    let name = &entity.attributes.friendly_name;
+
+    if !matches(&entity.entity_id, name) {
+      continue;
+    }
+
+    shown += 1;
+
+    let mut tags = vec![entity.state.clone()];
+
+    if !name.is_empty() {
+      tags.push(name.clone());
+    }
+    if wired.contains(&entity.entity_id.as_str()) {
+      tags.push("wired up".to_string());
+    }
+
+    println!("  {}  ({})", entity.entity_id, tags.join(", "));
+  }
+
+  if shown == 0 {
+    println!("  (nothing matches, out of {} entities)", entities.len());
+  }
+
+  // A typo here is silent until you say the words - Home Assistant
+  // answers a call naming an entity it does not have with a 200 and no
+  // state change - so call it out.
+  for entity in wired {
+    if !entities.iter().any(|it| it.entity_id == entity) {
+      println!(
+        "\n!! commands.toml refers to {entity:?}, which home assistant \
+         does not have"
+      );
+    }
+  }
 
   Ok(())
 }
@@ -991,7 +1137,7 @@ async fn run_phrase(
     hit.command.target()
   );
 
-  Dispatcher::new(file.obs, Feedback::new(&config.sounds_dir))?
+  Dispatcher::new(file.obs, &file.hass, Feedback::new(&config.sounds_dir))?
     .run(hit.command)
     .await
 }

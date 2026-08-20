@@ -2,7 +2,8 @@
 
 A background macOS agent that listens for **"computa, …"** and turns the
 command that follows into an HTTP request, an OBS change, a media key,
-an audio device switch, or a local program.
+an audio device switch, a Home Assistant service call, or a local
+program.
 
 ```
 computa, mute            ->  POST :8009/v1/voice/canary/mute/on
@@ -19,6 +20,8 @@ computa, skip            ->  media key: next track
 computa, play            ->  media key: play/pause
 computa, headphones      ->  default output device: AirPods
 computa, speakers        ->  default output device: the desk speakers
+computa, coffee          ->  Home Assistant: switch.coffee_machine
+                             toggle
 computa, are you         ->  a tone back, and nothing else
   listening?
 ```
@@ -271,6 +274,9 @@ voice-control listen             wake word detections only
 voice-control transcribe f.wav   STT + matcher against a file
 voice-control run "computa ps5"  match a phrase and dispatch it
 voice-control replay f.wav       whole pipeline against a file
+voice-control hass               list home assistant entities
+voice-control hass speaker       the ones matching a filter
+voice-control hass switch.desk_speakers      call a service, bare
 voice-control obs                list obs scenes
 voice-control obs "Camera Screen"  switch to a scene
 voice-control obs sources        list the sources in the current scene
@@ -566,6 +572,73 @@ That is not only cosmetic: writing the property fires the HAL
 notification it was set from, and there is another agent on this
 machine listening for that one.
 
+### Home Assistant
+
+`hass` calls a service on one entity over Home Assistant's REST API. A
+plain `url` step cannot: the API wants a bearer token and a JSON body,
+and neither is something an HTTP step carries.
+
+```toml
+[hass]
+url = "https://hass.lan"   # the base, no /api
+token = ""                 # empty reads HASS_TOKEN instead
+insecure = true            # accept the ingress certificate unchecked
+
+[[commands]]
+name = "speakers"
+phrases = ["speakers", "speaker", "on speakers", "to speakers"]
+hass = "switch.desk_speakers"
+service = "turn_on"
+```
+
+`service` defaults to `toggle`, for the same reason an OBS source
+does — a plug command is usually said the same way twice. It is taken
+as belonging to the entity's own domain, so `turn_on` on a `switch.`
+entity is `switch.turn_on`. A service that names a domain of its own is
+used as written, which is how the domain-agnostic ones are reached:
+
+```toml
+service = "homeassistant.turn_off"   # works on anything
+```
+
+`data` is anything else the service takes, sent alongside the entity —
+`data = { brightness = 128 }`. A switch needs none of it.
+
+Entities are enumerated one command at a time, the same as scenes: the
+daemon can only reach the ones you named. Copy the ids from:
+
+```bash
+voice-control hass                        # list them all
+voice-control hass speaker                # filtered, on id or name
+voice-control hass switch.desk_speakers   # toggle one, to check it
+voice-control hass switch.desk_speakers turn_on
+```
+
+The listing marks which entities commands already use and warns about
+any `hass =` your Home Assistant does not have. That warning is the
+whole reason it exists: **Home Assistant answers a call naming an
+entity it has never heard of with a perfectly happy 200 and no state
+change**, so a wrong id is otherwise indistinguishable from a working
+command until the day you say the words and nothing happens. The
+shape of the id is checked at startup for the same reason, and the
+dispatch logs how many entities each call actually changed — a `0`
+there is either something already in that state or an id that does not
+exist.
+
+**`insecure` skips certificate verification entirely.** A local ingress
+fronted by a CA only your network knows about is an ordinary way to run
+Home Assistant, and the alternative is teaching every machine about the
+CA. It does mean nothing is checking who answered, so leave it off for
+anything reached over the internet. It applies to the Home Assistant
+client alone — the HTTP steps get a client of their own, and a
+certificate exception for the plug in your office has no business
+weakening them.
+
+Switching outputs by plug rather than by device belongs here: make
+"speakers" turn the plug on and "headphones" turn it off, in place of
+the `output` steps above. Both at once is a [flow](#flows) — plug on,
+then point the default output at it.
+
 ### Programs
 
 `run` executes a local program. Everything else a command can do
@@ -821,6 +894,7 @@ never blocks anything.
 | `INPUT_DEVICE` | system default | case-insensitive substring of the device name |
 | `SOUNDS_DIR` | unset (silent) | directory holding `wake.wav`, `ok.wav`, `fail.wav`, and any wav a `sound` command names |
 | `OBS_PASSWORD` | unset | obs-websocket password, if not in the config |
+| `HASS_TOKEN` | unset | Home Assistant long-lived access token, if not in the config |
 | `DSTN_LOG` | `info` | tracing filter |
 | `TRAY` | `true` | menu bar status item |
 | `LOG_DIR` | `~/Library/Application Support/voice-control/logs` | what the menu's "Open logs" opens |
