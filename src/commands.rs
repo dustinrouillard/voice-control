@@ -14,6 +14,7 @@ use crate::exec::{self, Program};
 use crate::hass::{self, HassConfig, ServiceCall};
 use crate::media::MediaKey;
 use crate::obs::{ObsConfig, SourceAction, Visibility};
+use crate::spotify::{SpotifyAction, SpotifyConfig};
 use tracing::warn;
 
 /// Minimum similarity for a fuzzy match to count.
@@ -45,6 +46,8 @@ pub struct CommandFile {
   pub obs: ObsConfig,
   #[serde(default)]
   pub hass: HassConfig,
+  #[serde(default)]
+  pub spotify: SpotifyConfig,
   #[serde(default)]
   pub commands: Vec<Command>,
 }
@@ -147,6 +150,11 @@ pub struct Step {
   /// is nothing to name here beyond the key itself.
   #[serde(default)]
   pub media: Option<MediaKey>,
+  /// One Spotify Web API player control. Unlike `media`, this always
+  /// targets Spotify and includes controls with no keyboard key, such
+  /// as volume, seek, shuffle and repeat.
+  #[serde(default)]
+  pub spotify: Option<SpotifyAction>,
   /// The audio output to make default - a name from the `[devices]`
   /// table. Rewritten in place to the device pattern it stands for,
   /// the way `url` is rewritten from `[targets]`.
@@ -218,6 +226,7 @@ impl Default for Step {
       hide_delay_ms: None,
       wait_ms: None,
       media: None,
+      spotify: None,
       output: None,
       sound: None,
       input: None,
@@ -250,6 +259,7 @@ pub enum Action<'a> {
   Scene(&'a str),
   Source(SourceAction<'a>),
   Media(MediaKey),
+  Spotify(&'a SpotifyAction),
   /// Point one of the system's default audio devices somewhere else.
   /// `pattern` is a case-insensitive substring of the device name.
   Device {
@@ -268,8 +278,8 @@ pub enum Action<'a> {
 
 /// The fields a step can name an action with, for the errors about
 /// naming none of them or several.
-const ACTION_FIELDS: &str = "url, scene, source, media, output, input, sound, hass, run and \
-   wait_ms";
+const ACTION_FIELDS: &str = "url, scene, source, media, spotify, output, input, sound, hass, \
+   run and wait_ms";
 
 impl Command {
   /// The steps to run, in order - the explicit list, or the one the
@@ -310,6 +320,10 @@ impl Step {
     // they have nothing to be ambiguous with.
     if let Some(key) = self.media {
       return Action::Media(key);
+    }
+
+    if let Some(action) = &self.spotify {
+      return Action::Spotify(action);
     }
 
     if let Some(pattern) = &self.output {
@@ -381,6 +395,7 @@ impl Step {
       && self.source.is_none()
       && self.wait_ms.is_none()
       && self.media.is_none()
+      && self.spotify.is_none()
       && self.output.is_none()
       && self.input.is_none()
       && self.sound.is_none()
@@ -445,6 +460,10 @@ impl Step {
       }
     }
 
+    if let Some(action) = &self.spotify {
+      action.validate()?;
+    }
+
     // A move animation has to be undone by the matching move back, or
     // the source ends up parked wherever the last one left it - off
     // screen, and invisible next time it is shown.
@@ -465,6 +484,7 @@ impl Step {
       self.scene.is_some() && self.source.is_none(),
       self.wait_ms.is_some(),
       self.media.is_some(),
+      self.spotify.is_some(),
       self.output.is_some(),
       self.input.is_some(),
       self.sound.is_some(),
@@ -545,6 +565,17 @@ impl Step {
     Ok(())
   }
 
+  fn resolve_spotify(&self, spotify: &SpotifyConfig) -> Result<()> {
+    if self.spotify.is_some() && !spotify.configured() {
+      bail!(
+        "names a spotify action, but there is no [spotify] table with \
+         a client_id (and SPOTIFY_CLIENT_ID is unset)"
+      );
+    }
+
+    Ok(())
+  }
+
   /// Expands `~` in `run`, and says at startup when the program is not
   /// where the config says it is.
   ///
@@ -612,6 +643,7 @@ impl Step {
       Action::Http { method, url } => format!("{method} {url}"),
       Action::Scene(scene) => format!("obs scene {scene:?}"),
       Action::Media(key) => format!("media key {}", key.as_str()),
+      Action::Spotify(action) => action.target(),
       Action::Device { direction, pattern } => {
         format!("{} device {pattern:?}", direction.as_str())
       }
@@ -767,6 +799,7 @@ impl CommandFile {
           .and_then(|()| step.expand_targets(&self.targets))
           .and_then(|()| step.resolve_devices(&self.devices))
           .and_then(|()| step.resolve_hass(&self.hass))
+          .and_then(|()| step.resolve_spotify(&self.spotify))
           .and_then(|()| step.resolve_program())
           .with_context(|| {
             format!("command {name:?}, step {}", index + 1)
@@ -1077,6 +1110,64 @@ mod tests {
 
     assert_eq!(file.commands[0].step.media, Some(MediaKey::PlayPause));
     assert_eq!(file.commands[1].step.media, Some(MediaKey::PlayPause));
+  }
+
+  #[test]
+  fn a_spotify_volume_step_is_resolved_and_named() {
+    let raw = r#"
+      [spotify]
+      client_id = "client"
+
+      [[commands]]
+      name = "music quieter"
+      phrases = ["music quieter"]
+      spotify = { action = "volume_change", percent = -10 }
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    file.resolve().unwrap();
+
+    assert!(matches!(
+      file.commands[0].steps()[0].action(),
+      Action::Spotify(SpotifyAction::VolumeChange {
+        percent: -10,
+        device_id: None
+      })
+    ));
+    assert_eq!(file.commands[0].target(), "spotify volume -10%");
+  }
+
+  #[test]
+  fn rejects_a_spotify_step_without_spotify_configuration() {
+    let raw = r#"
+      [[commands]]
+      name = "music louder"
+      phrases = ["music louder"]
+      spotify = { action = "volume_change", percent = 10 }
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("[spotify] table"), "{why}");
+  }
+
+  #[test]
+  fn rejects_an_invalid_spotify_action_at_load_time() {
+    let raw = r#"
+      [spotify]
+      client_id = "client"
+
+      [[commands]]
+      name = "too loud"
+      phrases = ["too loud"]
+      spotify = { action = "volume", percent = 101 }
+    "#;
+
+    let mut file: CommandFile = toml::from_str(raw).unwrap();
+    let why = format!("{:#}", file.resolve().unwrap_err());
+
+    assert!(why.contains("0 through 100"), "{why}");
   }
 
   /// The alias is what the config says; the device pattern is what

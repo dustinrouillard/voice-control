@@ -2,8 +2,8 @@
 
 A background macOS agent that listens for **"computa, …"** and turns the
 command that follows into an HTTP request, an OBS change, a media key,
-an audio device switch, a Home Assistant service call, or a local
-program.
+a Spotify Web API control, an audio device switch, a Home Assistant
+service call, or a local program.
 
 ```
 computa, mute            ->  POST :8009/v1/voice/canary/mute/on
@@ -18,6 +18,7 @@ computa, ps5             ->  OBS scene "Main Screen", then animate the
 computa, hide ps5        ->  animate "Cam Link Screen" out
 computa, skip            ->  media key: next track
 computa, play            ->  media key: play/pause
+computa, music quieter   ->  Spotify: lower active device volume 10%
 computa, headphones      ->  default output device: AirPods
 computa, speakers        ->  default output device: the desk speakers
 computa, coffee          ->  Home Assistant: switch.coffee_machine
@@ -283,6 +284,9 @@ voice-control obs sources        list the sources in the current scene
 voice-control obs filters "Main Screen"      list a scene's filters
 voice-control obs toggle "Cam Link Screen"   flip a source, bare
 voice-control media next         press a media key, bare
+voice-control spotify authorize  authorize Spotify once with PKCE
+voice-control spotify devices    list Spotify Connect device ids
+voice-control spotify volume 40  set Spotify's volume, bare
 ```
 
 `transcribe` is the fast way to grow phrase lists without talking to a
@@ -463,6 +467,101 @@ voice-control run "computa skip"  # the command, matched and dispatched
 A grant belongs to the *responsible* process, so run from a terminal
 the check reflects that terminal's Accessibility rather than the
 binary's. Only the launchd copy answers for itself.
+
+### Spotify controls
+
+Use `spotify` when the command must target Spotify specifically or
+needs a control that has no media key. It implements every
+playback-changing Spotify Player API operation: play/resume, pause,
+next, previous, seek, repeat, shuffle, volume, queue, and Spotify
+Connect transfer. It also provides relative volume on top of the API.
+
+Spotify requires a Premium account for Web API playback control. Create
+an app in the [Spotify developer dashboard][spotify-dashboard], select
+Web API, and register this exact redirect URI:
+
+```
+http://127.0.0.1:8888/callback
+```
+
+Put the app's public client id in the command file—there is no client
+secret because the CLI uses OAuth authorization code with PKCE:
+
+```toml
+[spotify]
+client_id = "YOUR_CLIENT_ID"
+redirect_uri = "http://127.0.0.1:8888/callback"
+token_file = "~/.config/voice-control/spotify-refresh-token"
+```
+
+Then authorize it once. The browser asks only for playback read/write
+access, redirects to a short-lived loopback listener, and the CLI saves
+the refresh token with owner-only permissions:
+
+```bash
+voice-control spotify authorize
+voice-control spotify devices
+voice-control spotify volume 40
+```
+
+Access tokens are refreshed automatically. Spotify refresh tokens
+currently expire after six months, so rerun `authorize` when Spotify
+reports that the saved token has expired or been revoked. The client
+also persists a rotated refresh token if Spotify supplies one.
+
+A Spotify action is an inline table on a command:
+
+```toml
+[[commands]]
+name = "music louder"
+phrases = ["music louder", "turn up the music", "spotify louder"]
+spotify = { action = "volume_change", percent = 10 }
+
+[[commands]]
+name = "music quieter"
+phrases = ["music quieter", "turn down the music", "spotify quieter"]
+spotify = { action = "volume_change", percent = -10 }
+
+[[commands]]
+name = "music volume forty"
+phrases = ["music volume forty", "spotify volume forty"]
+spotify = { action = "volume", percent = 40 }
+```
+
+The complete action forms are:
+
+```toml
+spotify = { action = "play" }
+spotify = { action = "pause" }
+spotify = { action = "next" }
+spotify = { action = "previous" }
+spotify = { action = "seek", position_ms = 30000 }
+spotify = { action = "repeat", state = "track" } # off | track | context
+spotify = { action = "shuffle", state = true }
+spotify = { action = "volume", percent = 40 }
+spotify = { action = "volume_change", percent = -10 }
+spotify = { action = "queue", uri = "spotify:track:..." }
+spotify = { action = "transfer", device_id = "...", play = true }
+```
+
+All except `transfer` accept an optional `device_id`; without one they
+target the active device. Copy ids from `voice-control spotify devices`.
+Device ids are not guaranteed to remain stable, so omit one unless the
+command intentionally targets a particular Spotify Connect player.
+
+`play` can resume with no other fields, start a context, or start an
+explicit list of tracks:
+
+```toml
+spotify = { action = "play", context_uri = "spotify:playlist:...", offset_position = 2, position_ms = 0 }
+spotify = { action = "play", uris = ["spotify:track:...", "spotify:track:..."] }
+```
+
+`offset_uri = "spotify:track:..."` can replace `offset_position` for a
+context. A context and `uris` are mutually exclusive; invalid mixes and
+out-of-range volumes are rejected when the configuration loads.
+
+[spotify-dashboard]: https://developer.spotify.com/dashboard
 
 ### Tones
 
@@ -895,6 +994,8 @@ never blocks anything.
 | `SOUNDS_DIR` | unset (silent) | directory holding `wake.wav`, `ok.wav`, `fail.wav`, and any wav a `sound` command names |
 | `OBS_PASSWORD` | unset | obs-websocket password, if not in the config |
 | `HASS_TOKEN` | unset | Home Assistant long-lived access token, if not in the config |
+| `SPOTIFY_CLIENT_ID` | unset | Spotify application's public client id, if not in the config |
+| `SPOTIFY_REFRESH_TOKEN` | token file | Spotify PKCE refresh token; primarily useful when secrets are injected |
 | `DSTN_LOG` | `info` | tracing filter |
 | `TRAY` | `true` | menu bar status item |
 | `LOG_DIR` | `~/Library/Application Support/voice-control/logs` | what the menu's "Open logs" opens |

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,7 @@ use crate::feedback::Feedback;
 use crate::hass::{Hass, HassConfig};
 use crate::media;
 use crate::obs::{self, ObsConfig};
+use crate::spotify::{Spotify, SpotifyConfig};
 
 /// The APIs are on localhost or the LAN; if one is not answering
 /// promptly it is down, and blocking the pipeline helps nobody.
@@ -22,6 +24,7 @@ pub struct Dispatcher {
   /// nothing can reach a step that needs one - `resolve` rejects a
   /// hass step without a Home Assistant to send it to.
   hass: Option<Hass>,
+  spotify: Option<Arc<Spotify>>,
   feedback: Feedback,
 }
 
@@ -29,6 +32,7 @@ impl Dispatcher {
   pub fn new(
     obs: ObsConfig,
     hass: &HassConfig,
+    spotify: &SpotifyConfig,
     feedback: Feedback,
   ) -> Result<Self> {
     let client = reqwest::Client::builder()
@@ -44,8 +48,24 @@ impl Dispatcher {
       // of Home Assistant, and has no business weakening the calls to
       // everything else.
       hass: Hass::connect(hass)?,
+      spotify: Spotify::connect(spotify)?.map(Arc::new),
       feedback,
     })
+  }
+
+  /// Refreshes Spotify's OAuth access token in the background while the
+  /// daemon finishes starting, so the first spoken Spotify command does
+  /// not have to wait for both token refresh and playback HTTP calls.
+  pub fn warm_spotify(&self) {
+    let Some(spotify) = self.spotify.clone() else {
+      return;
+    };
+
+    tokio::spawn(async move {
+      if let Err(why) = spotify.warm().await {
+        warn!(error = ?why, "Spotify token warm-up failed");
+      }
+    });
   }
 
   /// Runs a command's steps in order, stopping at the first failure.
@@ -88,6 +108,20 @@ impl Dispatcher {
           .with_context(|| format!("pressing the {} key", key.as_str()))?;
 
         info!(command = %command.name, key = key.as_str(), "pressed");
+
+        Ok(())
+      }
+      Action::Spotify(action) => {
+        let Some(spotify) = &self.spotify else {
+          bail!("a Spotify action needs a [spotify] table with client_id");
+        };
+
+        spotify
+          .run(action)
+          .await
+          .with_context(|| format!("running {}", action.target()))?;
+
+        info!(command = %command.name, action = %action.target(), "controlled spotify");
 
         Ok(())
       }

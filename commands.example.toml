@@ -69,6 +69,19 @@ token = ""
 # who answered, so leave it off for anything reached over the internet.
 # insecure = true
 
+# Spotify Web API playback control. Create an application at
+# https://developer.spotify.com/dashboard, add
+# http://127.0.0.1:8888/callback as a redirect URI, then put its public
+# client id here. Run `voice-control spotify authorize` once afterward;
+# it stores the refresh token in the owner-only file below. No client
+# secret is used or needed (authorization is OAuth PKCE).
+#
+# Leave this commented when no Spotify commands are enabled.
+# [spotify]
+# client_id = "YOUR_CLIENT_ID"
+# redirect_uri = "http://127.0.0.1:8888/callback"
+# token_file = "~/.config/voice-control/spotify-refresh-token"
+
 # Base URLs, referenced as {name} below.
 [targets]
 # discord-rpc-control, running as a LaunchAgent on this machine.
@@ -166,6 +179,47 @@ media = "next"
 name = "previous track"
 phrases = ["previous", "previous song", "previous track", "last song", "go back a song"]
 media = "previous"
+
+# Spotify controls. These target Spotify specifically rather than the
+# application macOS happens to consider active, and cover every
+# playback-changing Player API endpoint. They require the [spotify]
+# table and one successful `voice-control spotify authorize`.
+#
+# The three transport commands above can use Spotify too:
+#   spotify = { action = "play" }
+#   spotify = { action = "pause" }
+#   spotify = { action = "next" }
+#   spotify = { action = "previous" }
+#
+# Other supported actions:
+#   spotify = { action = "volume", percent = 40 }
+#   spotify = { action = "volume_change", percent = 10 }
+#   spotify = { action = "seek", position_ms = 30000 }
+#   spotify = { action = "repeat", state = "off" } # off|track|context
+#   spotify = { action = "shuffle", state = true }
+#   spotify = { action = "queue", uri = "spotify:track:..." }
+#   spotify = { action = "transfer", device_id = "...", play = true }
+#
+# Any action except transfer may include `device_id = "..."`; omitted
+# means Spotify's active device. `voice-control spotify devices` lists
+# ids. Play can also start a context or explicit tracks:
+#   spotify = { action = "play", context_uri = "spotify:playlist:...", offset_position = 2, position_ms = 0 }
+#   spotify = { action = "play", uris = ["spotify:track:..."] }
+#
+# [[commands]]
+# name = "music louder"
+# phrases = ["music louder", "turn up the music", "spotify louder"]
+# spotify = { action = "volume_change", percent = 10 }
+#
+# [[commands]]
+# name = "music quieter"
+# phrases = ["music quieter", "turn down the music", "spotify quieter"]
+# spotify = { action = "volume_change", percent = -10 }
+#
+# [[commands]]
+# name = "music volume forty"
+# phrases = ["music volume forty", "spotify volume forty"]
+# spotify = { action = "volume", percent = 40 }
 
 # `sound` plays a wav from SOUNDS_DIR, named without the extension.
 # A command whose only step is one does nothing else, which is the

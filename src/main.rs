@@ -33,6 +33,7 @@ pub mod media;
 pub mod obs;
 pub mod pipeline;
 pub mod publish;
+pub mod spotify;
 pub mod status;
 pub mod stt;
 pub mod tray;
@@ -68,6 +69,9 @@ usage: voice-control [command]
   obs show|hide|toggle <source> [scene]
                       flip one source, without its filters
   media <key>         press a media key: play_pause, next or previous
+  spotify authorize   authorize the configured Spotify application
+  spotify devices     list Spotify Connect devices
+  spotify <action>    run a Spotify control; see `spotify help`
 ";
 
 /// Not `#[tokio::main]`: the menu bar needs the main thread for
@@ -110,6 +114,7 @@ fn main() -> Result<()> {
     Some("hass") => blocking(hass_cli(config, &args[1..])),
     Some("obs") => blocking(obs(config, &args[1..])),
     Some("media") => media_key(args.get(1)),
+    Some("spotify") => blocking(spotify_cli(config, &args[1..])),
     Some("-h" | "--help" | "help") => {
       print!("{USAGE}");
       Ok(())
@@ -169,8 +174,13 @@ fn run(config: Config) -> Result<()> {
   status.set_device(&capture.device);
 
   let feedback = Feedback::new(&config.sounds_dir);
-  let dispatcher =
-    Dispatcher::new(file.obs, &file.hass, feedback.clone())?;
+  let dispatcher = Dispatcher::new(
+    file.obs,
+    &file.hass,
+    &file.spotify,
+    feedback.clone(),
+  )?;
+  dispatcher.warm_spotify();
 
   let pipeline = Pipeline::new(
     Box::new(detector) as Box<dyn Detector>,
@@ -703,8 +713,13 @@ async fn replay(config: Config, path: Option<&String>) -> Result<()> {
     WhisperTranscriber::load(&file.stt.model, &file.vocabulary())?;
 
   let feedback = Feedback::new(&config.sounds_dir);
-  let dispatcher =
-    Dispatcher::new(file.obs, &file.hass, feedback.clone())?;
+  let dispatcher = Dispatcher::new(
+    file.obs,
+    &file.hass,
+    &file.spotify,
+    feedback.clone(),
+  )?;
+  dispatcher.warm_spotify();
 
   let mut pipeline = Pipeline::new(
     Box::new(detector) as Box<dyn Detector>,
@@ -1113,6 +1128,158 @@ fn media_key(key: Option<&String>) -> Result<()> {
   Ok(())
 }
 
+const SPOTIFY_USAGE: &str = "\
+usage: voice-control spotify <command>
+
+  authorize                    obtain and store a refresh token
+  devices                      list Spotify Connect devices
+  play | pause | next | previous
+  volume <0..100>              set absolute volume
+  volume-change <-100..100>    change volume, clamped to 0..100
+  seek <milliseconds>          seek in the current item
+  repeat <off|track|context>   set repeat mode
+  shuffle <on|off>             set shuffle mode
+  queue <spotify-uri>          add a track or episode to the queue
+  transfer <device-id> [play|pause]
+                               move playback to another device
+";
+
+/// Authorizes, inspects, or directly exercises Spotify without going
+/// through speech recognition. This is the equivalent of the `media`,
+/// `hass`, and `obs` diagnostic subcommands for Spotify.
+async fn spotify_cli(config: Config, args: &[String]) -> Result<()> {
+  let file = CommandFile::load(&config.resolved_config_path())?;
+
+  match args.first().map(String::as_str) {
+    Some("authorize") => {
+      let path = spotify::authorize(&file.spotify).await?;
+      println!("Spotify authorization saved to {}", path.display());
+      return Ok(());
+    }
+    Some("help") | Some("-h" | "--help") | None => {
+      print!("{SPOTIFY_USAGE}");
+      return Ok(());
+    }
+    _ => {}
+  }
+
+  let Some(client) = spotify::Spotify::connect(&file.spotify)? else {
+    bail!(
+      "no [spotify] table with client_id in {}",
+      config.resolved_config_path().display()
+    );
+  };
+
+  if args.first().is_some_and(|arg| arg == "devices") {
+    let devices = client.devices().await?;
+    if devices.is_empty() {
+      println!("Spotify reports no available devices");
+    }
+    for device in devices {
+      let id = device.id.as_deref().unwrap_or("<no id>");
+      let volume = device
+        .volume_percent
+        .map(|volume| format!("{volume}%"))
+        .unwrap_or_else(|| "unknown volume".into());
+      println!(
+        "{}{:24}  {:12}  {:3}  {}{}",
+        if device.is_active { "* " } else { "  " },
+        device.name,
+        device.kind,
+        volume,
+        id,
+        if device.is_restricted {
+          "  (restricted)"
+        } else if !device.supports_volume {
+          "  (no volume control)"
+        } else {
+          ""
+        }
+      );
+    }
+    return Ok(());
+  }
+
+  let action = spotify_cli_action(args)?;
+  client.run(&action).await?;
+  println!("ran {}", action.target());
+  Ok(())
+}
+
+fn spotify_cli_action(args: &[String]) -> Result<spotify::SpotifyAction> {
+  let action = args.first().map(String::as_str);
+  let argument = |name: &str| {
+    args
+      .get(1)
+      .ok_or_else(|| anyhow::anyhow!("spotify {name} needs an argument"))
+  };
+
+  let action = match action {
+    Some("play") => spotify::SpotifyAction::Play {
+      device_id: None,
+      context_uri: None,
+      uris: Vec::new(),
+      offset_position: None,
+      offset_uri: None,
+      position_ms: None,
+    },
+    Some("pause") => spotify::SpotifyAction::Pause { device_id: None },
+    Some("next") => spotify::SpotifyAction::Next { device_id: None },
+    Some("previous") => {
+      spotify::SpotifyAction::Previous { device_id: None }
+    }
+    Some("volume") => spotify::SpotifyAction::Volume {
+      percent: argument("volume")?
+        .parse()
+        .context("volume must be an integer from 0 through 100")?,
+      device_id: None,
+    },
+    Some("volume-change") => spotify::SpotifyAction::VolumeChange {
+      percent: argument("volume-change")?.parse().context(
+        "volume change must be an integer from -100 through 100",
+      )?,
+      device_id: None,
+    },
+    Some("seek") => spotify::SpotifyAction::Seek {
+      position_ms: argument("seek")?
+        .parse()
+        .context("seek position must be a positive integer")?,
+      device_id: None,
+    },
+    Some("repeat") => spotify::SpotifyAction::Repeat {
+      state: argument("repeat")?.parse()?,
+      device_id: None,
+    },
+    Some("shuffle") => spotify::SpotifyAction::Shuffle {
+      state: parse_on_off(argument("shuffle")?)?,
+      device_id: None,
+    },
+    Some("queue") => spotify::SpotifyAction::Queue {
+      uri: argument("queue")?.clone(),
+      device_id: None,
+    },
+    Some("transfer") => spotify::SpotifyAction::Transfer {
+      device_id: argument("transfer")?.clone(),
+      play: args.get(2).map(|value| parse_on_off(value)).transpose()?,
+    },
+    _ => {
+      print!("{SPOTIFY_USAGE}");
+      bail!("unknown Spotify command {:?}", action.unwrap_or_default());
+    }
+  };
+
+  action.validate()?;
+  Ok(action)
+}
+
+fn parse_on_off(value: &str) -> Result<bool> {
+  match value {
+    "on" | "true" | "play" => Ok(true),
+    "off" | "false" | "pause" => Ok(false),
+    _ => bail!("expected on or off"),
+  }
+}
+
 /// Matches a phrase and dispatches it, exactly as the daemon would -
 /// the way to check a command's whole sequence, filters and waits
 /// included, without saying anything.
@@ -1137,9 +1304,14 @@ async fn run_phrase(
     hit.command.target()
   );
 
-  Dispatcher::new(file.obs, &file.hass, Feedback::new(&config.sounds_dir))?
-    .run(hit.command)
-    .await
+  Dispatcher::new(
+    file.obs,
+    &file.hass,
+    &file.spotify,
+    Feedback::new(&config.sounds_dir),
+  )?
+  .run(hit.command)
+  .await
 }
 
 fn read_wav(path: &str) -> Result<Vec<f32>> {
